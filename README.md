@@ -1,5 +1,5 @@
-## SEG-RAG: Segmenting Large Multimodal Model for Region-level Retrieval-Augmented Generation
-This repository contains the code for the paper [SEG-RAG: Segmenting Large Multimodal Model for Region-level Retrieval-Augmented Generation](https://arxiv.org/abs/2305.XXXXX).
+## PixaR: Segmenting Large Multimodal Model for Region-level Retrieval-Augmented Generation
+This repository contains the code for the paper [PixaR: Segmenting Large Multimodal Model for Region-level Retrieval-Augmented Generation](https://arxiv.org/abs/2305.XXXXX).
 
 ## Requirements
 Install the required packages and dependencies with the following command:
