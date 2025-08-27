@@ -1,5 +1,5 @@
 import dataclasses
-from enum import auto, Enum
+from enum import Enum, auto
 from typing import List, Tuple
 
 

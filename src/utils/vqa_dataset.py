@@ -3,14 +3,14 @@ import os
 import random
 
 import cv2
-
-import model.conversation as conversation_lib
 import numpy as np
 import requests
 import torch
 import torch.nn.functional as F
+# import conversation as conversation_lib
+
 from datasets import load_dataset
-from model.segment_anything.utils.transforms import ResizeLongestSide
+# from model.segment_anything.utils.transforms import ResizeLongestSide
 from PIL import Image
 from transformers import CLIPImageProcessor
 

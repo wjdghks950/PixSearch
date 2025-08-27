@@ -1,18 +1,24 @@
 # multimodal_rag_dataset_builder
 
-import os, io, json, uuid, time, random, sys, logging, argparse, re
+import os, io, json, uuid, time, random, sys
+import logging, argparse, re, glob, requests
+import numpy as np
+import torch
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Union
 
 from openai import OpenAI
 from datasets import load_dataset, Dataset
 from PIL import Image
-import numpy as np
-import torch
 from tqdm import tqdm
+from itertools import islice
 
 from evaluation.rle_dict import get_mask_rle_dicts
 from utils.utils import (
+                            START_INFO_TOKEN,
+                            END_INFO_TOKEN,
+                            START_SEARCH_TOKEN,
+                            END_SEARCH_TOKEN,
                             image_to_base64,
                             DATASETS,
                             RETRY_BACKOFF_SECONDS,
@@ -22,9 +28,14 @@ from utils.utils import (
                             load_image_by_id,
                             extract_dict_like_str,
                             load_webqa_tsv_images,
-                            cache_image
+                            cache_image,
+                            extract_search_queries,
+                            append_retrieved_items,
+                            call_local_search
                         )
 from crop_cragmm_images import generate_gold_mask
+from local_search_api import LocalSearchPipeline
+from cragmm_search.search import UnifiedSearchPipeline
 
 
 # determine whether a question needs external knowledge or not
@@ -72,26 +83,43 @@ USER_QUESTION_DECOMPOSE = (
 
 # generate answer draft for the questions (with/without <search> token)
 SYS_DRAFT_ANSWER = (
-    "You are a visual reasoning assistant that understands user questions in light of the input image. "
-    "You will be writing the answer as a smart-glasses assistant that shares the point-of-view of its human user. "
-    "Keep the text concise. "
-    "Return exactly JSON with keys `{answer: str}`."
+    "You are a visual reasoning assistant answering questions about an image as a smart-glasses assistant. "
+    "Your answer must be concise and returned as JSON with exactly one key: {answer: str}. "
+    "When external knowledge is required, you will mark the exact place in your text where retrieval should happen "
+    "by inserting the token <search>. "
+    "CRITICAL: Place <search> immediately BEFORE the first token of any fact fragment that requires external knowledge "
+    "(e.g., a proper noun, date, model name, statistic, title). Do NOT state that fact before the <search> token. "
+    "Use exactly one space after <search> and continue the sentence. "
+    "Never add code fences, additional keys, or explanations—only JSON with {answer: ...}."
 )
+
 USER_DRAFT_ANSWER = (
-    "You should write a draft answer for the question asking about the image. Make sure to generate the answer right after `answer:`. "
+    "Write a draft answer for the question about the image. "
+    "If you do not need external knowledge, do NOT use <search>. "
+    "Return exactly JSON with {\"answer\": \"...\"}."
 )
+
 USER_DRAFT_ANSWER_FOR_RETRIEVAL = (
-    "You should write a draft answer for the question asking about the image. Make sure to generate the answer right after `answer:`. "
-    "There may be no input image for the question, but it may still require retrieval of external image or text knowledge to be answered. "
-    "You will be provided a question and ground-truth answers, along with the decomposed questions, the reasoning for the decomposition, and whether each subquestion needs to be answered with external image or text knowledge through retrieval or not. "
-    "Use the decomposed questions guide your reasoning in order to generate the answer. "
-    "If decomposed questions have `needs_retrieval == True`, then in your answer, make sure to insert `<search>` token(s) after a text span that corresponds to the decomposed question. "
-    "In contrast if `needs_retrieval == False` for a decomposed question, then you should not insert `<search>` token(s) after a text span that corresponds to the decomposed question. "
-    "Make sure the number of `needs_retrieval == True` and the number of `<search>` tokens match."
-    "For example, if there are N decomposed questions, then you should insert N `<search>` tokens in your answer using the decomposed questions step-by-step to guide your answer generation. "
-    "Also, this is very important: make sure to generate <search> token right before the answer text for each decomposed question. "
-    "This is because we are emulating a situation where the retrieved text is inserted right after the <search> token and before the answer text. "
-    "Here are some examples:\n"
+    "Write a draft answer for the question about the image. You are given: the question, ground-truth answers, "
+    "and the decomposition (reasoning, subquestions, and for each subquestion whether it needs retrieval). "
+    "Rules for <search>:\n"
+    "1) Insert one <search> for EACH subquestion with needs_retrieval == True.\n"
+    "2) Place <search> IMMEDIATELY BEFORE the answer fragment for that subquestion (the very first token of the grounded fact), "
+    "so retrieval happens BEFORE you state the fact. Do not place <search> after the fact or at the end of a sentence.\n"
+    "3) Use exactly one space after <search> and then continue the fact text.\n"
+    "4) For subquestions with needs_retrieval == False, do NOT use <search>.\n"
+    "5) The total number of <search> tokens MUST equal the number of subquestions where needs_retrieval == True.\n"
+    "Return exactly JSON with {\"answer\": \"...\"}.\n"
+    "Good examples:\n"
+    "- Q: From what brand can you buy the vehicle the person is driving?\n"
+    "  A: {\"answer\": \"I see a blue car <search> Subaru WRX 2021.\"}\n"
+    "- Q: Which car has a better gas mileage?\n"
+    "  A: {\"answer\": \"The car on the left <search> Subaru WRX averages 19 city / 26 highway, "
+    "and the car on the right <search> Honda CR-V 2WD averages 28 city / 34 highway.\"}\n"
+    "- Q: What is the theater and when did the namesake die?\n"
+    "  A: {\"answer\": \"The theater shown in the image <search> is named after Ricardo Montalban, "
+    "and he died in <search> 2009.\"}\n"
+    "Here are some additional examples:\n"
 )
 
 # determine the modality for each <search> token
@@ -368,7 +396,6 @@ def call_openai(args,
     """
     image_base64 = [image_to_base64(img, with_data_uri=True) for img in image_path] if image_path else None
 
-
     user_msg = {
         "role": "user",
         "content": [
@@ -435,7 +462,8 @@ def process_sample(args,
 
     if dataset_name == "aokvqa":
         qid = sample.get("question_id") or str(uuid.uuid4())
-        image_path = [sample.get("image")] or [sample.get("image_path")]
+        raw_img = sample.get("image") or sample.get("image_path")
+        image_path = [raw_img] if raw_img is not None else []
         cached_paths = cache_image(image_path, image_cache_dir, qid)
         question = sample.get("question")
         mc_choices = sample.get("choices")
@@ -444,7 +472,8 @@ def process_sample(args,
 
     elif dataset_name == "okvqa":
         qid = sample.get("question_id") or str(uuid.uuid4())
-        image_path = [sample.get("image")] or [sample.get("image_path")]
+        raw_img = sample.get("image") or sample.get("image_path")
+        image_path = [raw_img] if raw_img is not None else []
         cached_paths = cache_image(image_path, image_cache_dir, qid)
         question = sample.get("question")
         mc_choices = []
@@ -469,7 +498,8 @@ def process_sample(args,
 
     elif dataset_name == "vizwiz":
         qid = sample.get('id')
-        image_path = [sample.get("image")] or [sample.get("image_path")]
+        raw_img = sample.get("image") or sample.get("image_path")
+        image_path = [raw_img] if raw_img is not None else []
         cached_paths = cache_image(image_path, image_cache_dir, qid)
         question = sample.get("question")
         answers = sample.get("answers")
@@ -480,7 +510,8 @@ def process_sample(args,
     elif dataset_name == "textvqa":
         qid = sample.get("question_id") or str(uuid.uuid4())
         image_id = sample.get("image_id")
-        image_path = [sample.get("image")] or [sample.get("image_path")]
+        raw_img = sample.get("image") or sample.get("image_path")
+        image_path = [raw_img] if raw_img is not None else []
         cached_paths = cache_image(image_path, image_cache_dir, f"{qid}_{image_id}")
         question = sample.get("question")
         answers = sample.get("answers")
@@ -514,6 +545,7 @@ def process_sample(args,
     else:
         raise NotImplementedError(f"Dataset {dataset_name} not supported yet.")
 
+    # Determine if the sample needs retrieval or not
     needs_resp = call_openai(
         args,
         client,
@@ -530,6 +562,8 @@ def process_sample(args,
             needs_resp.lower().replace("```json", "").replace("```", "")
         )
         needs_retrieval = bool(needs_json["needs_retrieval"])
+        needs_retrieval_val = needs_json.get("needs_retrieval", None)
+        needs_retrieval = needs_retrieval_val if isinstance(needs_retrieval_val, bool) else str(needs_retrieval_val).lower().strip() == "true"
         needs_rationale = needs_json["reasoning"]
     except Exception:
         needs_retrieval = "true" in needs_resp.lower()
@@ -584,7 +618,6 @@ def process_sample(args,
                         ]
                     }
                 )
-
         answer_draft_question = question + "\nGround-truth Answer: " + str(answers)
         answer_draft_question += f"\nReasoning: {qdecomp_rationale}\n" + f"Subquestions: {qdecomp_subquestions}\n" + f"needs_retrieval: {str(qdecomp_retrieval)}"
 
@@ -601,128 +634,114 @@ def process_sample(args,
             sample["content"][0]["text"] = sample["content"][0]["text"].replace("<search> ", "")
             answer_incontext_samples.append(sample)
 
-    # construct answer drafts from the LLM
-    # number of search tokens should equal to the number of decomposed questions labeled as need_retrieval == True
-    quit_counter = 0
-    MAX_REGENERATE = 3
-    while True:
-        answer_resp = call_openai(
-            args,
-            client,
-            SYS_DRAFT_ANSWER,
-            user_draft_answer,
-            answer_draft_question,
-            image_path=image_path,
-            incontext_samples=answer_incontext_samples,
-            max_tokens=256,
-            json_mode=True,
+    # construct answer drafts from the LLM (single-shot; drop the sample if it violates constraints)
+    answer_resp = call_openai(
+        args,
+        client,
+        SYS_DRAFT_ANSWER,
+        user_draft_answer,
+        answer_draft_question,
+        image_path=image_path,
+        incontext_samples=answer_incontext_samples,
+        max_tokens=256,
+        json_mode=True,
+    )
+
+    # Parse JSON safely without lowercasing the entire payload (preserves case in the answer)
+    def _strip_code_fences(s: str) -> str:
+        s = s.strip()
+        if s.startswith("```"):
+            s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s, flags=re.IGNORECASE | re.DOTALL)
+        return s
+
+    try:
+        cleaned = _strip_code_fences(answer_resp)
+        answer_json = json.loads(cleaned)
+        answer_draft = str(answer_json.get("answer", "")).strip()
+    except Exception as e:
+        logging.warning("Failed to parse answer JSON for id=%s: %s. Dropping sample.", qid, e)
+        return None
+
+    expected_search = sum(qdecomp_retrieval)
+    found_search = answer_draft.count("<search>")
+    if expected_search != found_search:
+        logging.info(
+            "Dropping sample id=%s due to <search> token mismatch (expected=%d, found=%d).",
+            qid, expected_search, found_search
         )
-        try:
-            answer_json = json.loads(
-                answer_resp.lower().replace("```json", "").replace("```", "")
-            )
-            answer_draft = answer_json["answer"]
-        except Exception:
-            answer_draft = ""
-            print("DEBUG: answer_draft - ", answer_draft)
-            breakpoint()
-        try:
-            assert sum(qdecomp_retrieval) == answer_draft.count("<search>"), "Number of <search> tokens in the answer draft does not match the number of decomposed questions labeled as need_retrieval == True"
-            break
-        except AssertionError as e:
-            print("**** ERROR ****")
-            print("there are no <search> tokens in the answer draft but the qdecomp_retrieval is true - regenerating answer...")
-            print("DEBUG: needs_retrieval - ", needs_retrieval)
-            print("DEBUG: qdecomp_retrieval - ", qdecomp_retrieval)
-            print("DEBUG: answer_draft - ", answer_draft)
+        return None
 
-            regeneration_prompt = (
-                "\n*WARNING, regenerate the answer draft since you failed to add <search> tokens according to the decomposed questions.\n"
-                f"Your previously generated response: {answer_draft}\n"
-                "Regenerate the answer draft in JSON: "
-            )
-            if "*WARNING" not in answer_draft_question:
-                answer_draft_question = answer_draft_question + regeneration_prompt
-
-            if quit_counter >= MAX_REGENERATE:
-                print("**Max regenerate reached**")
-                break
-            quit_counter += 1
-            continue
+    # we only get here when counts match; compute num_search_toks for downstream logic
+    num_search_toks = found_search
 
     # assign qtype to each <search> token
-    num_search_toks = 0
     query_types, queries = [], []
     qtype_reasoning = ""
-    if needs_retrieval and sum(qdecomp_retrieval) > 0:  # both needs_retrieval and the qdecomp_retrieval should be unanimously true
-        if "<search>" not in answer_draft.lower():  # If not found, call <search> at the beginning and prepend
-            answer_draft = "<search> " + answer_draft  # we default to IMAGE search
-            query_types = ["IMAGE"]
-            queries = ["image"]
-        else:
-            num_search_toks = answer_draft.count("<search>")
-            # Build a function schema whose array lengths are fixed
-            router_schema = {
-                "name": "route_queries",
-                "description": "Choose retrieval modality and query for each <search> token",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "reasoning": {
-                            "type": "string",
-                            "items": {"type": "string"},
-                        },
-                        "query_types": {
-                            "type": "array",
-                            "minItems": num_search_toks,   # fixed length
-                            "maxItems": num_search_toks,
-                            "items": {"type": "string",
-                                    "enum": ["REGION","IMAGE","TEXT"]}
-                        },
-                        "queries": {
-                            "type": "array",
-                            "minItems": num_search_toks,
-                            "maxItems": num_search_toks,
-                            "items": {"type": "string"}
-                        }
+    if needs_retrieval and num_search_toks > 0:  # both needs_retrieval and the num_search_toks should be unanimously true
+         # Build a function schema whose array lengths are fixed
+        router_schema = {
+            "name": "route_queries",
+            "description": "Choose retrieval modality and query for each <search> token",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reasoning": {
+                        "type": "string",
+                        "items": {"type": "string"},
                     },
-                    "required": ["reasoning", "query_types","queries"]
-                }
+                    "query_types": {
+                        "type": "array",
+                        "minItems": num_search_toks,   # fixed length
+                        "maxItems": num_search_toks,
+                        "items": {"type": "string",
+                                "enum": ["REGION","IMAGE","TEXT"]}
+                    },
+                    "queries": {
+                        "type": "array",
+                        "minItems": num_search_toks,
+                        "maxItems": num_search_toks,
+                        "items": {"type": "string"}
+                    }
+                },
+                "required": ["reasoning", "query_types","queries"]
             }
-            router_tool = {
-                "type": "function",
-                "function": router_schema          # the dict that has name/description/parameters
-            }
-            modality_resp = call_openai(
-                args,
-                client,
-                SYS_QUERY_ROUTER,
-                USER_QUERY_ROUTER,
-                question + "\n" + str({'answer': answer_draft, 'num_search_toks': num_search_toks}),
-                image_path=image_path,
-                incontext_samples=incontext_samples_dict["modality_incontext_samples"],
-                max_tokens=256,
-                json_mode=True,
-                json_schema=router_tool,
-            )
-            try:
-                if not isinstance(modality_resp, dict) and isinstance(modality_resp, str):
-                    modality_json = json.loads(modality_resp.lower().replace("```json", "").replace("```", ""))
-                elif isinstance(modality_resp, dict):
-                    modality_json = modality_resp
+        }
+        router_tool = {
+            "type": "function",
+            "function": router_schema   # the dict that has name/description/parameters
+        }
 
-            except Exception:
-                print("DEBUG: modality_resp - ", modality_resp)
-                breakpoint()
-            qtype_reasoning = modality_json["reasoning"]
-            for qtype, query_txt in zip(modality_json['query_types'], modality_json['queries']):
-                if qtype.upper().strip() not in ["TEXT", "REGION", "IMAGE"]:
-                    try:
-                        raise ValueError(f"Unknown query type: {qtype}")
-                    except ValueError as e:
-                        breakpoint()
-                query_types.append(qtype.upper().strip())
-                queries.append(query_txt)
+        # assign qtype (modality type) to each <search> token
+        modality_resp = call_openai(
+            args,
+            client,
+            SYS_QUERY_ROUTER,
+            USER_QUERY_ROUTER,
+            question + "\n" + str({'answer': answer_draft, 'num_search_toks': num_search_toks}),
+            image_path=image_path,
+            incontext_samples=incontext_samples_dict["modality_incontext_samples"],
+            max_tokens=256,
+            json_mode=True,
+            json_schema=router_tool,
+        )
+        try:
+            if not isinstance(modality_resp, dict) and isinstance(modality_resp, str):
+                modality_json = json.loads(modality_resp.lower().replace("```json", "").replace("```", ""))
+            elif isinstance(modality_resp, dict):
+                modality_json = modality_resp
+
+        except Exception:
+            print("DEBUG: modality_resp - ", modality_resp)
+            breakpoint()
+        qtype_reasoning = modality_json["reasoning"]
+        for qtype, query_txt in zip(modality_json['query_types'], modality_json['queries']):
+            if qtype.upper().strip() not in ["TEXT", "REGION", "IMAGE"]:
+                try:
+                    raise ValueError(f"Unknown query type: {qtype}")
+                except ValueError as e:
+                    breakpoint()
+            query_types.append(qtype.upper().strip())
+            queries.append(query_txt)
 
     record = {
         "id"             : f"{dataset_name}-{qid}",
@@ -763,6 +782,7 @@ def process_sample(args,
 
         pattern = re.compile(r"<search>")
         start_pos = [m.start() for m in re.finditer(pattern, answer_draft.lower())]
+        # generate gold masks in case the <search> token's qtype == "REGION"
         for search_tok_idx, (qtype, query_txt) in enumerate(zip(query_types, queries)):
             call_entry = {}
             rle_dict = []
@@ -817,6 +837,319 @@ def process_sample(args,
 
     return record
 
+
+def interleave_search_and_query(
+    output_path: str,
+    processed_instances: List[Dict[str, Any]],
+    instances: List[Dict[str, Any]],
+    question_type_stat: List[Dict[str, Any]],
+    use_llm_for_span_extraction: bool = False):
+    """
+    Interleave search and query instances in a list of instances, and (NEW)
+    extract a REGION query text span that precedes each <search> token whose qtype == "REGION".
+
+    - If any mask.label (from the corresponding search_call) appears before the <search> token,
+      record that exact substring as the region_query_span.
+    - Otherwise, record the entire preceding sentence fragment as region_query_preceding_span,
+      and optionally call a small LLM to extract the best short span to highlight.
+
+    The extracted metadata is added to each REGION search_call:
+      * region_query_span (optional)
+      * region_query_span_source in {"label","llm"} (optional)
+      * region_query_span_offsets = [start_rtxt, end_rtxt] (optional)
+      * region_query_label, region_query_label_mask_index (when label matched)
+      * region_query_preceding_span, region_query_preceding_span_offsets (always when no label match)
+
+    Args:
+        output_path: JSONL file path for logging the 'processed_instances'
+        processed_instances: <search> payload </search> interleaved instances.
+        instance (List[Dict[str, Any]]): A list of <search> token-only instances.
+        question_type_stat (List[Dict[str, Any]]): A list of dictionaries containing the question type per question.
+    """
+
+    # NOTE: Run `calculate_dataset_stats.py` to get the question type statistics first from the `{name}_search_annotated_v1.jsonl` files
+    assert len(instances) == len(question_type_stat), (
+        f"The length of instance and question_type_stat must be equal. "
+        f"{len(instances)} != {len(question_type_stat)}"
+    )
+
+    # helper functions
+    def _find_case_insensitive(haystack: str, needle: str) -> Optional[tuple]:
+        """Return (start,end) of case-insensitive match of `needle` in `haystack`, else None."""
+        if not needle:
+            return None
+        m = re.search(re.escape(needle), haystack, flags=re.IGNORECASE)
+        if not m:
+            return None
+        return (m.start(), m.end())
+
+    def _call_llm_extract_span(preceding_span: str, label_hint: Optional[str]) -> Optional[str]:
+        """
+        Optionally call an LLM (if enabled) to pick best substring of `preceding_span`.
+        Returns the chosen substring (must be exact substring of preceding_span) or None.
+        """
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not (api_key and preceding_span.strip()):
+            return None
+
+        try:
+            from openai import OpenAI as _OpenAI
+            client = _OpenAI(api_key=api_key)
+            model_name = os.environ.get("REGION_SPAN_LLM_MODEL", "gpt-4.1-mini")
+
+            system_prompt = (
+                "You extract a short text span from a provided paragraph. "
+                "Return strictly JSON: {\"span\": \"...\"}. "
+                "The span MUST be an exact substring of the paragraph and no more than 8 words. "
+                "Prefer a concrete noun phrase that best refers to the region described by the hint."
+            )
+            user_prompt = (
+                "Paragraph (context before <search>):\n"
+                f"{preceding_span}\n\n"
+                f"Hint about the region (may be empty): {label_hint or ''}\n\n"
+                "Return JSON with the best exact substring to highlight."
+            )
+            params = dict(
+                model=model_name,
+                temperature=0.0,
+                messages=[{"role": "system", "content": system_prompt},
+                          {"role": "user", "content": user_prompt}],
+                response_format={"type": "json_object"},
+                max_tokens=64
+            )
+            resp = client.chat.completions.create(**params)
+            content = resp.choices[0].message.content.strip()
+            # basic robust parse
+            content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.IGNORECASE | re.DOTALL)
+            data = json.loads(content)
+            span = (data.get("span") or "").strip()
+            if span and span in preceding_span:
+                return span
+        except Exception as _e:
+            pass  # fallback on any LLM errors
+        return None
+
+    # interleave <search> </search> with query text + region query span for qtype == "REGION"
+    print(f"Starting from : {len(processed_instances)}")
+    pattern = re.compile(r"<search>")
+
+    with open(output_path, "a") as jsonl_writer:
+        pbar_desc = f"[{instances[0]['dataset']}] Interleaving search and query for {len(instances)} instances"
+        for i, (instance, qtype_dict) in tqdm(
+                enumerate(zip(instances[len(processed_instances):], question_type_stat[len(processed_instances):])),
+                desc=pbar_desc
+        ):
+            question_type = qtype_dict["label"].lower().strip()
+            answer_draft = instance["answer_draft"]
+            if any(k in question_type for k in ("factoid", "kb", "external", "entity")):
+                # interleave the <search> </search> with query text
+                question = instance["question"]
+                answer_draft = instance["answer_draft"]
+                start_pos_list = sorted([m.start() for m in re.finditer(pattern, answer_draft.lower())])
+                search_calls = instance["search_calls"]
+                search_calls_start_pos_list = sorted([int(pos['position']) for pos in search_calls])
+
+                try:
+                    assert all(p == q for p, q in zip(start_pos_list, search_calls_start_pos_list)), f"List Mismatch - start_pos_list: {start_pos_list} | search_calls_start_pos_list: {search_calls_start_pos_list}"
+                except AssertionError as e:
+                    print(e)
+                    breakpoint()
+
+                # perform region span extraction before mutating the answer_draft
+                pos2sc = {}
+                for sc in search_calls:
+                    try:
+                        pos2sc[int(sc["position"])] = sc
+                    except Exception:
+                        continue
+
+                for pos in start_pos_list:
+                    sc = pos2sc.get(pos)
+                    if not sc or sc.get("qtype", "").upper() != "REGION": # we need region query text span only for REGION qtypes
+                        continue
+
+                    # 1. full preceding text up to <search> position
+                    preceding_span = answer_draft[:pos].strip(" \t")
+
+                    # 2. exact label match first
+                    label_matched = False
+                    label_match_offsets = None
+                    label_text_used = None
+                    label_mask_idx_used = None
+                    masks = sc.get("mask") or []
+                    for mi, m in enumerate(masks):
+                        label = (m.get("label") or "").strip()
+                        if not label:
+                            continue
+                        # try locating within preceding span
+                        region_txt = _find_case_insensitive(preceding_span, label)
+                        if region_txt:
+                            start_rtxt, end_rtxt = region_txt
+                            sc["region_query_span"] = answer_draft[start_rtxt:end_rtxt]
+                            sc["region_query_span_source"] = "label"
+                            sc["region_query_span_offsets"] = [start_rtxt, end_rtxt]
+                            sc["region_query_label"] = label
+                            sc["region_query_label_mask_index"] = mi
+                            label_matched = True
+                            label_match_offsets = (start_rtxt, end_rtxt)
+                            label_text_used = label
+                            label_mask_idx_used = mi
+                            break
+
+                    # 3. if no label match, store preceding span; optionally LLM to pick a short span
+                    if not label_matched:
+                        # always store the full preceding span + offsets
+                        sc["region_query_preceding_span"] = preceding_span
+                        sc["region_query_preceding_span_offsets"] = [0, pos]
+
+                        # optional LLM best-substring extraction
+                        if use_llm_for_span_extraction:
+                            span_llm = _call_llm_extract_span(preceding_span, label_hint=(masks[0].get("label") if masks else None))
+                            if span_llm:
+                                region_txt = _find_case_insensitive(preceding_span, span_llm)
+                                if region_txt:
+                                    start_rtxt, end_rtxt = region_txt
+                                    sc["region_query_span"] = answer_draft[start_rtxt:end_rtxt]  # exact substring
+                                    sc["region_query_span_source"] = "llm"
+                                    sc["region_query_span_offsets"] = [start_rtxt, end_rtxt]
+
+                # alignment check and insert <search> payload </search> & interactively fix erroneous instances in case there are errors
+                try:
+                    assert len(search_calls) == len(start_pos_list), f"The length of search_calls and number of <search> tokens must be equal. {len(search_calls)} != {len(start_pos_list)}"
+                except AssertionError as e:
+                    # 1. Rewrite
+                    # 2. Get the new start_pos_list
+                    # 3. assign / drop each search call to its new position according to start_pos_list
+                    print(f"\n\n----MANUAL Filtering (instance number: {i} | dataset_name: {instance['dataset']})----\n")
+                    print(f"(Original) Question: {question}")
+                    print(f"(Original) Answer Draft: {answer_draft}")
+                    print(f"(Search Pos.) <search> tokens starting indices : ", start_pos_list)
+                    print("==============================")
+                    for i, sc in enumerate(search_calls):
+                        print(f"> ({i}) Search Call: {sc}")
+                    print("==============================")
+
+                    if instance['dataset'] == 'oven':
+                        user_prompt = input("Press 'Enter' to continue or type 'fix' to revise...")
+
+                    if user_prompt == "fix" or instance['dataset'] != 'oven':
+                        answer_draft = input("* New Answer Draft >> ")
+                        start_pos_list = sorted([m.start() for m in re.finditer(pattern, answer_draft.lower())])
+                        print("* (new) <search> tokens starting indices : ", start_pos_list)
+                        new_search_calls = []
+                        for i, sc in enumerate(search_calls):
+                            sc['position'] = int(input(f"New pos index for {i}-th <search> token (qtype: {sc['qtype']} | query_text: {sc['query_text']}) (input '-1' to drop the search call): "))
+                            if sc['position'] != -1:
+                                new_search_calls.append(sc)
+                        search_calls = new_search_calls
+                        print(f"** New Answer Draft: {answer_draft}\n")
+                        print(f"** New Search Calls: {search_calls}\n")
+                        input("To Proceed, Press 'Enter'...")
+                    else: # just drop the last search call
+                        search_calls = search_calls[:-1]
+
+                for sc in sorted(search_calls, key=lambda c: c["position"], reverse=True):  # reverse order to prevent pos index from being off
+                    if sc["qtype"] == "REGION":
+                        payload = "<region>"
+                    elif sc["qtype"] == "IMAGE":
+                        payload = "<img>"
+                    elif sc["qtype"] == "TEXT":
+                        payload = sc["query_text"].lower().strip()
+                    resp = f"<search> {payload} </search>"
+                    start_pos = sc["position"]
+                    end_pos = sc["position"] + len("<search>")
+                    answer_draft = answer_draft[:start_pos] + resp + answer_draft[end_pos:]
+                instance["search_calls"] = search_calls
+            else:
+                # remove <search> </search> from the answer draft
+                answer_draft = " ".join(answer_draft.replace(" <search>", "").replace("<search> ", "").split())
+                instance["needs_retrieval"] = False
+                instance["num_search_toks"] = 0
+                instance["decomposed_needs_retrieval"] = [False for _ in range(len(instance["decomposed_questions"]))]
+                instance["search_calls"] = []
+
+            instance["answer"] = answer_draft
+            processed_instances.append(instance)
+
+            # append the fixed instance line by line in here
+            jsonl_writer.write(json.dumps(instance, ensure_ascii=False, default=str) + "\n")
+
+    return processed_instances
+
+
+def interleave_retrieved(
+    output_path: str,
+    processed_instances: List[Dict[str, Any]],
+    instances: List[Dict[str, Any]],
+    search_pipeline: Union[LocalSearchPipeline, UnifiedSearchPipeline],
+    ktype: str = "title",  # "title", "entity", "all" (include all the retrieved attributes)
+    region_type: str = "mask", # "mask", "bbox"
+    k: int = 5):
+    """
+    Interleave the top-'k' retrieved instances into the model output (between the <information> and </information> tokens)
+
+    Args:
+        ktype - knowledge type; "title", "content", "entity", "all" (include all the retrieved attributes)
+    """
+
+    print(f"Starting from : {len(processed_instances)}")
+    pattern = re.compile(r"<search>")
+
+    with open(output_path, "a") as jsonl_writer:
+        for i, instance in tqdm(enumerate(instances[len(processed_instances):]), desc=f"[{instances[0]['dataset']}] Interleaving retrieved results for {len(instances)} instances"):
+            ds_name = instance["dataset"]
+            question = instance["question"]
+            image = instance["image_path"]
+            answer_draft = instance["answer_draft"]
+            search_interleaved_answer = instance["answer"]
+            start_pos_list = sorted([m.start() for m in re.finditer(pattern, search_interleaved_answer.lower())])
+            search_calls = instance["search_calls"]
+            if start_pos_list:
+                search_queries = extract_search_queries(search_interleaved_answer)  # extract search queries in between <search> </search> tokens
+                search_queries = [q.lower().strip() for q in search_queries]
+                retrieved_items = []
+                for qidx, q in enumerate(search_queries):  # construct different input_query per search query type
+                    if q == "<img>":
+                        input_query = image
+                    elif q == "<region>":
+                        region_dir_path = os.path.dirname(search_calls[qidx]["mask_path"][0][region_type])
+                        input_query = glob.glob(os.path.join(region_dir_path, "cropped_*.png"))[0]  # NOTE: there could be multiple queries
+                    else:  # text query
+                        input_query = q
+
+                    r = search_pipeline(input_query, k=k)  # send the search queries to the search pipeline
+                    retrieved_items.append(r)  # 'r' is list of lists (inner list == # of search_queries)
+
+                    # NOTE: For Crag-mm search api, some 'r' is list of list while some 'r' are list of list of list
+                    # (which causes inconsistency in the number of retrieved items)
+
+                instance["retrieved"] = {"k": k, "item": retrieved_items}
+                # interleave the retrieved text (e.g., title, summary, plot) with the <information> </information> tokens and save
+                filtered_retrieved_items = []
+                for item in retrieved_items:
+                    if ktype == "all":
+                        filtered_r = [f"{str(r['title'])}: {str(r['content'])}" for r in item]
+                    elif ktype == "entity":
+                        try:
+                            filtered_r = [str(r["entities"]) for r in item]
+                        except Exception as e:
+                            print(e)
+                            breakpoint()
+                    elif ktype == "title":
+                        filtered_r = [str(r["title"]) for r in item]
+                    elif ktype == "content":
+                        filtered_r = [str(r["content"]) for r in item]
+                    filtered_retrieved_items.append(filtered_r)
+
+                # construct the <information> </information> tokens interleaved with retrieved items
+                final_text, info_offsets = append_retrieved_items(search_interleaved_answer, filtered_retrieved_items)
+
+                instance["answer"] = final_text
+                instance["info_offsets"] = info_offsets
+                processed_instances.append(instance)
+
+            # append the fixed instance line by line in here
+            jsonl_writer.write(json.dumps(instance, ensure_ascii=False, default=str) + "\n")
 
 
 def parse_args(args: list[str] = None, config_str: str = None):
@@ -884,6 +1217,8 @@ def parse_args(args: list[str] = None, config_str: str = None):
         help="Dataset output directory",
     )
     parser.add_argument("--dataset_name", default="region_rag_vqa", type=str)
+    parser.add_argument("--question_type_stat_path", default="question_types.json", type=str)
+
     parser.add_argument("--openai_api_key", default=os.getenv("OPENAI_API_KEY"))
     parser.add_argument(
         "--sam_checkpoint",
@@ -911,11 +1246,25 @@ def parse_args(args: list[str] = None, config_str: str = None):
     parser.add_argument("--mask_alpha", default=0.4, type=float)
     parser.add_argument("--limit_num", default=-1, type=int)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--version_num", default=0, type=int)
+
+    parser.add_argument("--topk", default=5, type=int)
 
     # webqa args
     parser.add_argument("--webqa_tsv_path", default="/home/jeonghkim/projects/region-mm-retrieve/data/webqa/WebQA_imgs/WebQA_imgs_7z_chunks/imgs.tsv", type=str)
     parser.add_argument("--webqa_lineidx_path", default="/home/jeonghkim/projects/region-mm-retrieve/data/webqa/imgs.lineidx", type=str)
     parser.add_argument("--webqa_img_cache_dir", default="/home/jeonghkim/projects/region-mm-retrieve/data/webqa/WebQA_imgs", type=str)
+
+    # local search api flags
+    parser.add_argument("--retriever", default="local", type=str, help="cragmm search api or local faiss index (i.e., local search api)")
+    parser.add_argument("--search_api_url", default="http://127.0.0.1:7000", type=str)
+    parser.add_argument("--search_api_collection", default="wiki10k_index", type=str)
+    parser.add_argument("--search_api_index_name", default=None, type=str)  # optional override
+    parser.add_argument("--search_api_pooling", default="mean", choices=["mean", "cls"])
+    parser.add_argument("--search_api_text_model", default="sentence-transformers/all-mpnet-base-v2", type=str)
+    parser.add_argument("--search_api_image_model", default="facebook/dinov3-vitb16-pretrain-lvd1689m", type=str)
+
+    parser.add_argument("--use_llm_for_span_extraction", action="store_true")
 
     args = parser.parse_string(config_str) if config_str else parser.parse_args(args)
     return args, parser
@@ -967,6 +1316,33 @@ def main(args: list[str] = None, config_str: str = None):
     incontext_samples_dict["answer_incontext_samples"] = answer_incontext_samples
     incontext_samples_dict["modality_incontext_samples"] = modality_incontext_samples
 
+    if args.question_type_stat_path is not None:
+        with open(os.path.join(args.output_dir, args.dataset_name, args.question_type_stat_path), "r") as fp:
+            question_type_stat = json.load(fp)
+            print(f">> Loaded question type stats from {args.question_type_stat_path}")
+
+    if args.retriever is None or args.retriever == "local":
+        search_pipeline = LocalSearchPipeline(
+            base_url=args.search_api_url,
+            collection=args.search_api_collection,
+            index_name=args.search_api_index_name,
+            pooling=args.search_api_pooling,
+            text_model=args.search_api_text_model,
+            image_model=args.search_api_image_model,
+        )
+    elif retriever == "cragmm":
+        os.environ["HTTPS_PROXY"] = "http://fwdproxy:8080"
+        os.environ["NO_PROXY"] = ",".join([
+            ".fbcdn.net", ".facebook.com", ".thefacebook.com", ".tfbnw.net",
+            ".fb.com", ".fburl.com", ".facebook.net", ".sb.fbsbx.com", "localhost"
+        ])
+        search_pipeline = UnifiedSearchPipeline(
+            image_model_name="openai/clip-vit-large-patch14-336",
+            image_hf_dataset_id="crag-mm-2025/image-search-index-validation",
+            text_model_name="BAAI/bge-large-en-v1.5",
+            web_hf_dataset_id="crag-mm-2025/web-search-index-validation",
+        )
+
     # generate data samples for the datasets
     for ds_name, cfg in DATASETS.items():
 
@@ -997,7 +1373,7 @@ def main(args: list[str] = None, config_str: str = None):
 
         out_dir = os.path.join(args.output_dir, args.dataset_name, ds_name)
         os.makedirs(out_dir, exist_ok=True)
-        output_file = os.path.join(out_dir, f"{ds_name}_search_annotated.jsonl")
+        output_file = os.path.join(out_dir, f"{ds_name}_search_annotated_v{str(args.version_num)}.jsonl")
         buffer = []
         if os.path.exists(output_file):  # load from cache
             print(f">> Loading from cache: {output_file}")
@@ -1012,11 +1388,60 @@ def main(args: list[str] = None, config_str: str = None):
             for idx, sample in enumerate(tqdm(ds, total=len(ds))):
                 if len(buffer) > idx:
                     continue
-                if idx >= args.limit_num:
+                if len(buffer) >= args.limit_num:
                     break
                 rec = process_sample(args, client, sample, ds_name, out_dir, incontext_samples_dict)
+                if rec is None:
+                    # dropped due to invalid JSON or <search> token mismatch
+                    print(f">> Skipping invalid JSON or <search> token mismatch: ds_name: {ds_name} | idx: {idx} | len: {len(buffer)}")
+                    continue
                 buffer.append(rec)
                 f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+
+        # based on the constructed data and question type stats, interleave `<search> search_query </search>`` tokens
+        # if the question type is not in ["Factoid / KB Questions", "Multi-hop External Knowledge Reasoning", "Fine-grained Entity-Identification"]
+        # then we simply remove the <search> tokens and revert back to the original response
+        interleaved_buffer = []
+        interleaved_output_file = os.path.join(out_dir, f"{ds_name}_search_interleaved_v{str(args.version_num)}.jsonl")
+        if os.path.exists(interleaved_output_file):
+            print(f">> Loading from cache: {interleaved_output_file}")
+            with open(interleaved_output_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    interleaved_buffer.append(json.loads(line))
+            print(f">> Loaded from cache: {interleaved_output_file} | len: {len(interleaved_buffer)}")
+        if len(interleaved_buffer) < len(buffer):
+            interleaved_buffer = interleave_search_and_query(
+                                    interleaved_output_file,
+                                    interleaved_buffer,
+                                    buffer,
+                                    question_type_stat[ds_name],
+                                    args.use_llm_for_span_extraction
+                                )
+
+        # after building the `interleaved_buffer`, interleave the search API-retrieved results between the <information> </information> tokens
+        # <information> </information> tokens should immediately follow the <search> </search> tokens
+        # based on each of the search calls, retrieve using cragmm search api and then interleave with <information> </information> tokens
+        retrieved_buffer = []
+        # retrieved_output_file = os.path.join(out_dir, f"{ds_name}_retrieve_k_{args.topk}_interleaved_v{str(args.version_num)}.jsonl")
+        retrieved_output_file = os.path.join(out_dir, f"{ds_name}_retrieve_k_{args.topk}_interleaved_v{str(args.version_num + 1)}.jsonl")
+        if os.path.exists(retrieved_output_file):
+            print(f">> Loading from cache: {retrieved_output_file}")
+            with open(retrieved_output_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    retrieved_buffer.append(json.loads(line))
+            print(f">> Loaded from cache: {retrieved_output_file} | len: {len(retrieved_buffer)}")
+        if len(retrieved_buffer) < len(interleaved_buffer):
+            retrieved_buffer = interleave_retrieved(
+                                    retrieved_output_file,
+                                    retrieved_buffer,
+                                    interleaved_buffer,
+                                    search_pipeline,
+                                    ktype="title",
+                                    k=args.topk,
+                                    )
+
 
 if __name__ == "__main__":
     main()

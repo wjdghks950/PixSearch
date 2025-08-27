@@ -11,11 +11,15 @@ import requests
 from PIL import Image
 from pathlib import Path
 from urllib.parse import urlparse
-from typing import List, Optional, Union, Tuple, Any
+from typing import List, Optional, Union, Tuple, Any, Dict
 from .image_loader import ImageLoader
 
 # Special tokens
 DEFAULT_IMAGE_TOKEN = "<image>"
+START_SEARCH_TOKEN = "<search>"
+END_SEARCH_TOKEN = "</search>"
+START_INFO_TOKEN = "<information>"
+END_INFO_TOKEN = "</information>"
 
 # Default values for FFmpeg used in resize
 MAX_SIDE = 336
@@ -25,14 +29,21 @@ TIMEOUT_SECONDS = 60
 TEMPERATURE = 0.2
 RETRY_BACKOFF_SECONDS = [5, 10, 20]
 
+# FB devserver proxy for external web connection establishment
+os.environ["HTTPS_PROXY"] = "http://fwdproxy:8080"
+os.environ["NO_PROXY"] = ",".join([
+    ".fbcdn.net", ".facebook.com", ".thefacebook.com", ".tfbnw.net",
+    ".fb.com", ".fburl.com", ".facebook.net", ".sb.fbsbx.com", "localhost"
+])
+
 DATASETS = {
     "aokvqa":  {"hf_name": "HuggingFaceM4/A-OKVQA", "split": "train"},
     "okvqa":   {"hf_name": "HuggingFaceM4/OK-VQA",   "split": "train"},
     "webqa":   {"hf_name": "TreezzZ/WebQA",       "split": "train"},
     "textvqa": {"hf_name": "lmms-lab/textvqa", "split": "train"},
-    "vizwiz":  {"hf_name": "HuggingFaceM4/VizWiz", "split": "train"},
     "infoseek": {"hf_name": "ychenNLP/oven", "split": "train"},
     "oven": {"hf_name": "ychenNLP/oven", "split": "train"},
+    # "vizwiz":  {"hf_name": "HuggingFaceM4/VizWiz", "split": "train"},
     # "encyclopedicvqa": {"hf_name": "", "split": "train"},
     # "visual_genome": {"hf_name": "visual_genome", "split": "train"},
     # "kvqa":    {"hf_name": "AdaptAI/KVQA",          "split": "train"},
@@ -40,6 +51,149 @@ DATASETS = {
     # "scienceqa": {"hf_name": "lukaemon/ScienceQA",  "split": "train"},
     # "cragmm": {"hf_name": "crag-mm-2025/crag-mm-single-turn-public", "split": "validation"}
 }
+
+
+def call_local_search(
+    session: requests.Session,
+    base_url: str,
+    *,
+    model_str: str,
+    qtype: str,                  # "text" | "image" | "fused"
+    query: Optional[str] = None,
+    image_paths: Optional[List[str]] = None,
+    top_k: int = 5,
+    collection: Optional[str] = None,  # wiki10k_index
+    index_name: Optional[str] = None,
+    pooling: str = "mean",
+    timeout: float = 60.0,
+) -> List[Dict[str, Any]]:
+    """
+    Calls the local FastAPI Search service /search endpoint and returns the 'hits' list.
+    """
+    payload = {
+        "model_str": model_str,
+        "qtype": qtype,
+        "top_k": int(top_k),
+        "collection": collection,
+        "index_name": index_name,
+        "pooling": pooling,
+    }
+    if qtype == "text":
+        payload["query"] = query or ""
+    elif qtype in ("image", "region"):
+        if qtype == "image":
+            payload["image_paths"] = image_paths or []
+        elif qtype == "region":
+            raise NotImplementedError("Region search is not supported yet.")  # TODO: Implement region search
+    elif qtype == "fused":  # both 'text' and 'image' are required
+        payload["query"] = query or ""
+        payload["image_paths"] = image_paths or []
+        payload["query"] = query or ""
+        payload["image_paths"] = image_paths or []
+    else:
+        raise ValueError(f"Unsupported qtype: {qtype}")
+
+    url = base_url.rstrip("/") + "/search"
+    # simple retry loop
+    last_err = None
+    for attempt in (1, 2, 3):
+        try:
+            resp = session.post(url, json=payload, timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("hits", [])
+        except Exception as e:
+            last_err = e
+            time.sleep(0.6 * attempt)
+    raise RuntimeError(f"Search API call failed after retries: {last_err}")
+
+
+
+def save_faiss_checkpoint(idx, meta_batches, progress_path, index_path, meta_dir, line_no, next_id):
+    # write / overwrite the faiss index
+    faiss.write_indx(idx, str(index_path))
+
+    # flush buffered metadata, one shard per checkpoint
+    if meta_batches:
+        shard = meta_dir / f"meta_{line_no:012d}.feather"
+        feather.write_feather(pa.concat_tables(meta_batches), shard)
+        meta_batches.clear()
+    # record the progress
+    with open(progress_path, "w") as progress_fp:
+        json.dump({"line_no": line_no, "next_id": next_id}, progress_fp)
+
+
+def extract_search_queries(text: str) -> List[str]:
+    """
+    Return a list of substrings that occur between <search> … </search> tokens.
+
+    Example
+    -------
+    >>> s = ("I see a fire hydrant and this was made in "
+    ...      "<search> when was fire hydrant made? </search> by "
+    ...      "<search> who made the first fire hydrant? </search> garret sanders sr.")
+    >>> extract_search_queries(s)
+    ['when was fire hydrant made?', 'who made the first fire hydrant?']
+    """
+    # DOTALL lets the dot match new-lines; non-greedy .*? stops at the first </search>
+    pattern = re.compile(r"<search>(.*?)</search>", re.DOTALL | re.IGNORECASE)
+
+    # Strip leading/trailing whitespace inside each pair, then return the list
+    return [match.group(1).strip() for match in pattern.finditer(text)]
+
+
+def append_retrieved_items(text: str, information_lists: List[str]) -> Tuple[str, List[int]]:
+    """
+    Insert <information>...</information> blocks immediately after every
+    </search> close-tag in `text`.
+
+    Parameters
+    ----------
+    text : str
+        The original text containing one or more "<search> … </search>" spans.
+    information_list : List[str]
+        The information snippets to insert, in the same order as the
+        <search> spans appear.  The number of elements must match the number
+        of </search> tags.
+
+    Returns
+    -------
+    final_text : str
+        The text with all <information> blocks inserted.
+    info_offsets : List[int]
+        0-based character indices in `final_text` where each "<information>"
+        tag begins (the index of the "<" character).
+    """
+    end_search_tok_pattern = re.compile(r'</search>')
+    end_search_tok_matches = list(end_search_tok_pattern.finditer(text))
+    if len(end_search_tok_matches) != len(information_lists):
+        raise ValueError( f"Found {len(end_search_tok_matches)} </search> tags but received {len(information_list)} retrieved knowledge snippets.")
+
+    parts: List[str] = []
+    info_offsets: List[int] = []
+    pointer = 0
+    current_len = 0
+
+    for match, info in zip(end_search_tok_matches, information_lists):
+        end_idx = match.end()
+        segment = text[pointer:end_idx]
+        parts.append(segment)
+        current_len += len(segment)
+
+        payload = " | ".join(info).strip()  # the retrieved information
+
+        # inject the <information> ... </information> span
+        info_block = f" {START_INFO_TOKEN} {payload} {END_INFO_TOKEN}"
+        info_offsets.append(current_len + 1)  # +1 skips the leading space
+        parts.append(info_block)
+        current_len += len(info_block)
+        pointer = end_idx
+
+    parts.append(text[pointer:])
+    final_text = "".join(parts)
+
+    return final_text, info_offsets
+
 
 
 def image_to_base64(
@@ -58,7 +212,7 @@ def image_to_base64(
     Returns:
         Base-64 encoded image as **str**.
     """
-    # ── 1. Load image if we were given a path/URL ───────────────────────────
+    # load image if we were given a path/URL
     if isinstance(image, str):
         if image.startswith("http"):
             image = ImageLoader(image).get_image()
@@ -67,13 +221,17 @@ def image_to_base64(
     elif not isinstance(image, Image.Image):
         raise TypeError("`image` must be a path/URL or PIL.Image.Image")
 
-    # ── 2. Encode to bytes buffer ───────────────────────────────────────────
+    # convert to RGB if needed
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
+    # encode to bytes buffer
     buf = io.BytesIO()
     image.save(buf, format=fmt.upper())
     b64_bytes = base64.b64encode(buf.getvalue())
     b64_str = b64_bytes.decode("utf-8")
 
-    # ── 3. Optionally prepend data-URI prefix ───────────────────────────────
+    # optionally prepend data-URI prefix
     if with_data_uri:
         b64_str = f"data:image/{fmt.lower()};base64,{b64_str}"
 
@@ -380,18 +538,35 @@ def load_webqa_tsv_images(
     return id2img, img_paths
 
 
+def _load_image(obj: Union[str, Image.Image]) -> Image.Image:
+    """Return a PIL.Image from a URL / path / PIL.Image."""
+    if isinstance(obj, Image.Image):
+        return obj
+    p = Path(obj)
+    if p.is_file():
+        return Image.open(p)
+    return image_to_pil(obj)
+
+def _to_png_compatible(im: Image.Image) -> Image.Image:
+    """
+    Ensure `im` is in a mode that Pillow can write as PNG.
+    PNG supports '1', 'L', 'LA', 'RGB', 'RGBA'.
+    Everything else is converted to 'RGB'.
+    """
+    return im if im.mode in {"1", "L", "LA", "RGB", "RGBA"} else im.convert("RGB")
+
 def cache_image(
     image_paths: List[Union[str, Image.Image]],
     out_dir: Union[str, Path],
     qid: str,
 ) -> List[str]:
     """
-    Persist every image in *image_paths* under *out_dir* using deterministic
-    filenames derived from *qid*. Returns a list of **local file paths**.
+    Persist every image in `image_paths` under `out_dir` using deterministic
+    filenames derived from `qid`. Returns a list of local file path.
 
     Rules
     -----
-    • If the element is a PIL.Image it is saved directly.
+    • If the element is a PIL.Image it is saved diresctly.
     • If the element is a local path it is copied (metadata preserved).
     • Otherwise it is treated as a URL / remote resource: we load with
       image_to_pil() and save.
@@ -402,6 +577,7 @@ def cache_image(
 
     cached_paths: List[str] = []
     for idx, img in enumerate(image_paths):
+        img = _to_png_compatible(_load_image(img))
         # One image →  "<qid>.png"
         # Multiple →  "<qid>_<idx>.png"
         fname = f"{qid}{'_' + str(idx) if len(image_paths) > 1 else ''}.png"
