@@ -1,0 +1,12 @@
+/data
+.DS_STORE
+__pycache__
+*.code-workspace
+/runs
+src/external
+*-part_comparator_cache.json
+./src/models/PLUM/runs
+**/.nfs*
+src/models/groundingLMM/mmcv
+src/models/groundingLMM/output
+wandb
