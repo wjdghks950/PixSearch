@@ -7,8 +7,9 @@ fi
 
 export PYTHONPATH="/home/jeonghkim/projects/pixar:$PYTHONPATH"
 
-MODEL_CKPT_PATH=/home/jeonghkim/projects/pixar/pixar/src/model/runs/pixar-13b_kld_0.1_focal_tversky_8_pixar_ft/merged_model
-# MODEL_CKPT_PATH=/home/jeonghkim/projects/pixar/pixar/src/model/runs/plum-13b_kld_0.1_focal_tversky_8_v1_0shot_w_reasonseg/merged_model
+CKPT_PARENT_PATH=/home/jeonghkim/projects/pixar/pixar/src/model/runs
+MODEL_CKPT_PATH=$CKPT_PARENT_PATH/pixar-13b_kld_0.1_focal_tversky_8_pixar_ft/merged_model
+# MODEL_CKPT_PATH=$CKPT_PARENT_PATH/plum-13b_kld_0.1_focal_tversky_8_v1_0shot_w_reasonseg/merged_model
 
 CUDA_VISIBLE_DEVICES=${gpu_ids} python chat_pixar_search.py \
 	  --version=$MODEL_CKPT_PATH \
