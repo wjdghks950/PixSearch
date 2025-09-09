@@ -3,6 +3,7 @@ from enum import Enum
 import os
 import yaml
 import json
+import re
 import cv2
 import pycocotools.mask as mask_utils
 import numpy as np
@@ -18,6 +19,14 @@ DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_IMAGE_PATCH_TOKEN = "<im_patch>"
 DEFAULT_IM_START_TOKEN = "<im_start>"
 DEFAULT_IM_END_TOKEN = "<im_end>"
+
+SEARCH_START_TOKEN = "<search>"
+SEARCH_END_TOKEN = "</search>"
+INFORMATION_START_TOKEN = "<information>"
+INFORMATION_END_TOKEN = "</information>"
+DEFAULT_REGION_TOKEN = "<region>"
+
+QTYPE2ID = {"TEXT": 0, "IMAGE": 1, "REGION": 2}
 
 TOK_START_CHAR = '▁'  # token start character
 BIO_NO_LBL = 0
@@ -310,7 +319,7 @@ def match_substrings(
 
     assert len(anchor_idx) == 1, f"Anchor token '{anchor_token}' found multiple times in the full text | anchor_idx: {anchor_idx} | full_text_ids: {full_text_ids} | anchor_text: {tokenizer.convert_ids_to_tokens(anchor_ids)} | full_text: {tokenizer.convert_ids_to_tokens(full_text_ids)}"
     anchor_idx = anchor_idx[0]
-    
+
     # NOTE: multiple matches are possible for the same substring
     # substring match is only valid after the anchor_token
     # - e.g., "tail" in "red tail, curvy tail"
@@ -323,7 +332,7 @@ def match_substrings(
             for i in range(1, len(substring_ids)):
                 per_token_labels[substring_idx + i] = BIO_INTERM_LBL
             mask_positions.add(substring_idx)
-    
+
     return matched_substrings, per_token_labels, mask_positions
 
 def _with_patch_offset(token_idx: int):
@@ -344,3 +353,30 @@ def _imread_rgb_sans_icc(path: str) -> np.ndarray:
         if img_bgr is None:
             return np.zeros((224, 224, 3), dtype=np.uint8)
         return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+
+def _info_char_spans(text: str):
+    '''
+    Returns list of (start_char, end_char) for the content inside
+    <information>...</information> tags (excludes the tags themselves).
+    '''
+    spans = []
+    for m in re.finditer(r"<information>(.*?)</information>", text, flags=re.DOTALL):
+        inner = m.group(1)
+        s, e = m.span(1)  # raw inner span including any spaces
+        # trim leading/trailing whitespace from the inner span
+        ltrim = len(inner) - len(inner.lstrip())
+        rtrim = len(inner) - len(inner.rstrip())
+        s += ltrim
+        e -= rtrim
+        if s < e:
+            spans.append((s, e))
+    return spans
+
+
+def _search_char_spans(text: str):
+    """
+    Return [(start_char, end_char)] for each literal '<search>' opening tag.
+    Indices cover exactly the 8 characters '<search>'.
+    """
+    return [(m.start(), m.end()) for m in re.finditer(rf"{SEARCH_START_TOKEN}", text)]

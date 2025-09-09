@@ -7,7 +7,7 @@ FREE_PORT=$(python -c "import socket; s=socket.socket(); s.bind(('',0)); print(s
 
 # 1) Model size
 if [ -z "$1" ]; then
-    read -p "Enter PLUM model size (13B or 7B): " model_size
+    read -p "Enter PIXAR model size (13B or 7B): " model_size
 else
     model_size=$1
 fi
@@ -72,7 +72,7 @@ fi
 
 if [ "$dice_type" == "true" ]; then
     DICE_TYPE="focal_tversky"
-    
+
     # 10) FOCAL_ALPHA
     if [ -z "${10}" ]; then
         read -p "Enter FOCAL_ALPHA (default 0.7): " input_focal_alpha
@@ -105,11 +105,8 @@ fi
 
 # Convert model_size to lower case
 model_size=$(echo "$model_size" | tr '[:upper:]' '[:lower:]')
-
-LLAVA_MODEL_PATH=liuhaotian/llava-llama-2-13b-chat-lightning-preview
-
 if [ "$model_size" = "13b" ]; then
-    LLAVA_MODEL_PATH="liuhaotian/llava-llama-2-13b-chat-lightning-preview"
+    LLAVA_MODEL_PATH=/home/jeonghkim/projects/pixar/hf_cache/llava-llama-2-13b-chat-lightning-preview
 elif [ "$model_size" = "7b" ]; then
     LLAVA_MODEL_PATH="/shared/nas2/jk100/partonomy_private/weights/liuhaotian/llava-llama-2-7b-chat-lightning-lora-preview"
 else
@@ -117,12 +114,13 @@ else
     exit 1
 fi
 
-VISION_MODEL_PATH=/shared/nas/data/m1/jk100/code/OpenAttrLibrary/LISA/weights/sam_vit_h_4b8939.pth
-DATASET_DIR=/shared/nas/data/m1/jk100/code/OpenAttrLibrary/LISA/dataset
+# paths
+VISION_MODEL_PATH=/home/jeonghkim/projects/pixar/weights/sam_vit_h_4b8939.pth
+DATASET_DIR=/home/jeonghkim/projects/pixar/data/region_rag_vqa
+VISION_TOWER=/home/jeonghkim/projects/pixar/hf_cache/clip-vit-large-patch14
 
-# NOTE: 0shot means no finetuning on Partonomy dataset
-# EXP_NAME="plum-${model_size}_kld_${kld_loss_weight}_${DICE_TYPE}_${dice_loss_weight}_v1_0shot_no_reasonseg"
-EXP_NAME="plum-${model_size}_kld_${kld_loss_weight}_${DICE_TYPE}_${dice_loss_weight}_v1_0shot_w_reasonseg"
+# NOTE: "stage1"
+EXP_NAME="pixar-${model_size}_kld_${kld_loss_weight}_${DICE_TYPE}_${dice_loss_weight}_stage1"
 
 echo "Running experiment: $EXP_NAME"
 echo " - kld_loss_weight=${kld_loss_weight}"
@@ -135,13 +133,14 @@ echo " - Using GPUs: ${gpu_ids}"
 
 
 # Execute the training command with the specified parameters.
-deepspeed --include localhost:${gpu_ids} --master_port=${FREE_PORT} plum_train_ds.py \
+deepspeed --include localhost:${gpu_ids} --master_port=${FREE_PORT} pixar_train_ds.py \
     --version=$LLAVA_MODEL_PATH \
     --dataset_dir=$DATASET_DIR \
     --vision_pretrained=$VISION_MODEL_PATH \
     --dataset="sem_seg||refer_seg||vqa||reason_seg" \
-    --val_dataset="reason_seg|val" \
-    --sample_rates="9,5,5,1" \
+    --val_dataset="ade20k|validation" \
+    --vqa_data="llava_v1_5_mix665k" \
+    --sample_rates="9,9,5,1" \
     --batch_size=$BATCH_SIZE \
     --grad_accumulation_steps 10 \
     --use_bidir_bio \
@@ -153,23 +152,15 @@ deepspeed --include localhost:${gpu_ids} --master_port=${FREE_PORT} plum_train_d
     --exp_name="$EXP_NAME" \
     $TEACHER_REF \
     --precision="$precision" \
-	--model_max_length 512 \
+	--model_max_length 1024 \
     --dice_scale_factor 1000.0 \
-    --epochs 25 \
+    --epochs 10 \
     --train_mask_prompt_encoder \
     --focal_tversky_alpha=$FOCAL_ALPHA \
     --focal_tversky_beta=$FOCAL_BETA \
     --bidir_dim_feedforward 2048 \
+    --use_feedback_loop \
     --auto_resume
 
-    #  --use_feedback_loop \ # TODO: Revive after testing!! (ONLY FOR REBUTTAL EXPERIMENT)
-
-    # --sample_rates="5,9,5,1" \
-    # --vision-tower="naclip" \
-    # --sample_rates="6,9,5,1" \ - plum-13B_0shot_dice_6
-    # --sample_rates="9,5,5,1" \ - plum-13B_0shot_dice_8
-    # --train_mask_prompt_encoder \
-    # --use_cross_attn_bio \
-    # --use_bidir_bio \
-    # --grad_accumulation_steps 20 \
-    # --lr 2e-5 \
+# --vqa_data="llava_v1_5_mix665k" \
+# --vqa_data="llava_instruct_150k" \

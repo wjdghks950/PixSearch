@@ -18,17 +18,12 @@ import uvicorn
 from transformers import AutoTokenizer, AutoModel, AutoImageProcessor
 from tqdm import tqdm
 
-# -----------------------------
-# Constants / Defaults
-# -----------------------------
+
 TEXT_MODEL = "sentence-transformers/all-mpnet-base-v2"
 GME_MODEL  = "Alibaba-NLP/gme-Qwen2-VL-2B-Instruct"
 IMAGE_MODEL = "facebook/dinov3-vitb16-pretrain-lvd1689m"
 
-# -----------------------------
-# Helpers
-# -----------------------------
-
+# helpers
 def slug_from_model_str(model_str: str) -> str:
     # e.g., "sentence-transformers/all-mpnet-base-v2" -> "all-mpnet-base-v2"
     return model_str.split("/")[-1].lower()

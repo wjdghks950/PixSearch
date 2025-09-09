@@ -150,7 +150,7 @@ def init_partonomy(base_image_dir):
         # each concept and part will be an atomic concept (e.g., airplanes--attack is a class and airplanes--attack--part:bomb racks is a class on its own)
         partonomy_classes.append(super_coarse)
         partonomy_classes.extend(parts_list)
-    
+
     partonomy_classes = list(set(partonomy_classes))  # remove any duplicate class
     for cls_lbl in partonomy_classes:
         partonomy_images.extend(glob.glob(os.path.join(base_image_dir, "partonomy", "images", cls_lbl, "*.jpg")))
@@ -313,7 +313,7 @@ class SemSegDataset(torch.utils.data.Dataset):
         class_ids = []
         for sampled_cls in sampled_classes:
             text = sampled_cls
-            
+
             assert len(text.split("||")) == 1
             question_template = random.choice(self.short_question_list)
             questions.append(question_template.format(class_name=text.lower()))
@@ -358,10 +358,12 @@ class SemSegDataset(torch.utils.data.Dataset):
             for class_id in class_ids:
                 masks.append(label == class_id)
             masks = torch.stack(masks, dim=0)
-        
+
         per_token_label_dict = [{k: v} for k, v in zip(sampled_classes, masks)]
         if len(conversations) > len(per_token_label_dict):
             per_token_label_dict.extend([{} for _ in range(len(conversations) - len(per_token_label_dict))])
+
+        search_calls_norm = []
 
         return (
             image_path,
@@ -373,5 +375,6 @@ class SemSegDataset(torch.utils.data.Dataset):
             resize,
             questions,
             sampled_classes,
-            per_token_label_dict
+            per_token_label_dict,
+            search_calls_norm
         )

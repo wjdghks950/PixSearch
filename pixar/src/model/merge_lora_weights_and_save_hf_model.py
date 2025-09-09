@@ -11,7 +11,7 @@ import transformers
 from peft import LoraConfig, get_peft_model
 from transformers import AutoTokenizer
 
-from model.PLUM import PLUMForCausalLM
+from model.PIXAR import PIXARForCausalLM
 from utils.utils import DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN
 
 
@@ -37,7 +37,7 @@ def parse_args(args):
     parser.add_argument(
         "--vision-tower", default="openai/clip-vit-large-patch14", type=str
     )
-    
+
     # PLUM-specific arguments
     parser.add_argument("--use_teacher_ref", action="store_true", default=False)
     parser.add_argument("--use_bidir_bio", action="store_true", default=False)
@@ -46,7 +46,7 @@ def parse_args(args):
     parser.add_argument("--use_hinge_loss", action="store_true", default=False)
     parser.add_argument("--pred_binary_span", action="store_true", default=False)
     parser.add_argument("--use_cross_attn_bio", action="store_true", default=False)
-    
+
     # Training arguments that affect model structure
     parser.add_argument("--bidir_nhead", default=8, type=int)
     parser.add_argument("--bidir_dim_feedforward", default=2048, type=int)
@@ -61,7 +61,7 @@ def parse_args(args):
     parser.add_argument("--kld_sigma", default=1.0, type=float)
     parser.add_argument("--focal_tversky_alpha", default=0.7, type=float)
     parser.add_argument("--focal_tversky_beta", default=0.3, type=float)
-    
+
     # LoRA arguments
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument("--lora_alpha", default=16, type=int)
@@ -78,7 +78,7 @@ def parse_args(args):
         choices=["llava_v1", "llava_llama_2"],
     )
     parser.add_argument("--weight", default="", type=str, required=True)
-    parser.add_argument("--save_path", default="./plum_model_ckpt", type=str, required=True)
+    parser.add_argument("--save_path", default="./model_ckpt", type=str, required=True)
     return parser.parse_args(args)
 
 
@@ -135,12 +135,12 @@ def main(args):
         torch_dtype = torch.bfloat16
     elif args.precision == "fp16":
         torch_dtype = torch.half
-    
-    print("Creating PLUM model with complete arguments...")
-    model = PLUMForCausalLM.from_pretrained(
+
+    print("Creating PIXAR model with complete arguments...")
+    model = PIXARForCausalLM.from_pretrained(
         args.version, torch_dtype=torch_dtype, low_cpu_mem_usage=False, **model_args
     )
-    
+
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -150,10 +150,10 @@ def main(args):
     model.get_model().initialize_vision_modules(model.get_model().config)
     vision_tower = model.get_model().get_vision_tower()
     vision_tower.to(dtype=torch_dtype)
-    
-    # Initialize PLUM modules
-    print("Initializing PLUM modules...")
-    model.get_model().initialize_plum_modules(model.get_model().config, **model_args)
+
+    # Initialize PIXAR modules
+    print("Initializing PIXAR modules...")
+    model.get_model().initialize_pixar_modules(model.get_model().config, **model_args)
 
     # Create mask_pooler structure if needed
     if model.use_feedback_loop:
@@ -175,7 +175,7 @@ def main(args):
                             x not in name
                             for x in [
                                 "visual_model",
-                                "vision_tower", 
+                                "vision_tower",
                                 "mm_projector",
                                 "text_hidden_fcs",
                                 "token_to_mask_fcs"
@@ -209,37 +209,37 @@ def main(args):
     # load the trained weights - overwrite any random initialization
     print(">> loading weights from: ", args.weight)
     state_dict = torch.load(args.weight, map_location="cpu")
-    
+
     # remove teacher_llm weights if present (not needed for inference)
     state_dict = {k: v for k, v in state_dict.items() if "teacher_llm" not in k}
-    
+
     # load with strict=False to handle any missing keys gracefully
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     print(f"Missing keys: {len(missing_keys)}")
     print(f"Unexpected keys: {len(unexpected_keys)}")
-    
+
     if missing_keys:
         print("Missing keys:", missing_keys[:10])  # Show first 10
     if unexpected_keys:
         print("Unexpected keys:", unexpected_keys[:10])  # Show first 10
-    
+
     print(">> loaded weights from: ", args.weight)
 
     print("Merging LoRA weights...")
     model = model.merge_and_unload()
-    
+
     # save the merged model
     state_dict = {}
     for k, v in model.state_dict().items():
         if "vision_tower" not in k:
             state_dict[k] = v
-    
+
     print(f"Saving merged model to: {args.save_path}")
     model.save_pretrained(args.save_path, state_dict=state_dict)
     tokenizer.save_pretrained(args.save_path)
-    
+
     print("Merge completed successfully!")
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:]) 
+    main(sys.argv[1:])

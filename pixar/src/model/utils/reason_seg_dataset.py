@@ -168,7 +168,7 @@ class ReasonSegDataset(torch.utils.data.Dataset):
             # add explanation if applicable
             img_name = image_path.split("/")[-1]
             if self.explanatory != -1 and img_name in self.img_to_explanation:
-                if choice == 0:  # text-label in self.answer_list template 
+                if choice == 0:  # text-label in self.answer_list template
                     answer_template = random.choice(self.answer_list)
                     answers.append(answer_template.format(class_name=sampled_response_texts[idx]))
                 elif choice == 1:  # [SEG] token + text answer
@@ -220,12 +220,14 @@ class ReasonSegDataset(torch.utils.data.Dataset):
             masks = np.stack(sampled_masks, axis=0)
             masks = torch.from_numpy(masks)
             label = torch.ones(masks.shape[1], masks.shape[2]) * self.ignore_label
-            
+
         # make sure to account for the length of conversations equals the length of per_token_label_dict
         per_token_label_dict = [{k: v} for k, v in zip(sampled_sents, masks)]
         sampled_sents = [s for s in sampled_response_texts]
         if len(conversations) > len(per_token_label_dict):
             per_token_label_dict.extend([{} for _ in range(len(conversations) - len(per_token_label_dict))])
+
+        search_calls_norm = []
 
         return (
             image_path,
@@ -237,5 +239,6 @@ class ReasonSegDataset(torch.utils.data.Dataset):
             resize,
             questions,
             sampled_sents,
-            per_token_label_dict
+            per_token_label_dict,
+            search_calls_norm
         )

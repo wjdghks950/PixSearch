@@ -2,13 +2,13 @@ from dataclasses import dataclass, asdict
 from typing import Any
 from .evaluators import Evaluator
 from .rle_dict import RLEDict
-from qa_generation import QuestionType
+# from qa_generation import QuestionType
 
 @dataclass
 class Prediction:
     image_path: str = None
 
-    question_type: QuestionType = None
+    # question_type: QuestionType = None
     questions: list[str] = None
 
     parts_answer_choices: list[str] = None
@@ -36,14 +36,14 @@ class Prediction:
 
     def to_dict(self):
         d = asdict(self)
-        if self.question_type is not None:
-            d['question_type'] = self.question_type.value
+        # if self.question_type is not None:
+        #     d['question_type'] = self.question_type.value
         return d
 
     @staticmethod
     def from_dict(data: dict):
-        if data['question_type'] is not None:
-            data['question_type'] = QuestionType(data['question_type'])
+        # if data['question_type'] is not None:
+        #     data['question_type'] = QuestionType(data['question_type'])
 
         return Prediction(**data)
 

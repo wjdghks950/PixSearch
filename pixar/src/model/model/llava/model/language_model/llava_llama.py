@@ -21,6 +21,7 @@ from torch.nn import CrossEntropyLoss
 from transformers import (AutoConfig, AutoModelForCausalLM, LlamaConfig,
                           LlamaForCausalLM, LlamaModel)
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 from ..llava_arch import LlavaMetaForCausalLM, LlavaMetaModel
 
@@ -115,7 +116,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             # Enable model/pipeline parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
-                
+
             if output_per_instance_loss:
                 # Average loss over each sequence, ignoring padding tokens/other ignored tokens
                 loss = loss.view(labels.size(0), -1)
@@ -168,6 +169,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         )
         return model_inputs
 
-
-AutoConfig.register("llava", LlavaConfig)
+try:
+    AutoConfig.register("llava", LlavaConfig, exist_ok=True)
+except TypeError:
+    if "llava" not in CONFIG_MAPPING:
+        AutoConfig.register("llava", LlavaConfig)
 AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM)

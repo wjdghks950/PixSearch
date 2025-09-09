@@ -99,18 +99,57 @@ class LlavaMetaForCausalLM(ABC):
         self, input_ids, attention_mask, past_key_values, labels, images
     ):
         vision_tower = self.get_vision_tower()
+
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
+
+            def _past_len(pk):
+                # works across DynamicCache/StaticCache and old tuple/list caches (for previous version of HF)
+                if pk is None:
+                    return 0
+                # newer HF caches
+                if hasattr(pk, "get_seq_length"):
+                    try:
+                        return int(pk.get_seq_length())
+                    except Exception:
+                        pass
+                if hasattr(pk, "past_key_values_length"):
+                    try:
+                        return int(pk.past_key_values_length)
+                    except Exception:
+                        pass
+                # Older list/tuple: try to find a tensor with a seq dim
+                try:
+                    last = pk[-1]
+                    if isinstance(last, (list, tuple)):
+                        for x in reversed(last):
+                            if isinstance(x, torch.Tensor):
+                                return int(x.shape[-2])
+                    if isinstance(last, torch.Tensor):
+                        return int(last.shape[-2])
+                except Exception:
+                    pass
+                return 0
+
             if (
                 past_key_values is not None
                 and vision_tower is not None
                 and images is not None
                 and input_ids.shape[1] == 1
             ):
-                attention_mask = torch.ones(
-                    (attention_mask.shape[0], past_key_values[-1][-1].shape[-2] + 1),
-                    dtype=attention_mask.dtype,
-                    device=attention_mask.device,
-                )
+                bsz = (attention_mask.shape[0] if attention_mask is not None else input_ids.shape[0])
+                pastlen = _past_len(past_key_values)
+                if attention_mask is None:
+                    attention_mask = torch.ones(
+                        (bsz, pastlen + 1),  # +1 is for currently decoded token
+                        dtype=torch.long,
+                        device=input_ids.device,
+                    )
+                else:
+                    attention_mask = torch.ones(
+                        (bsz, pastlen + 1),
+                        dtype=attention_mask.dtype,
+                        device=attention_mask.device,
+                    )
             return input_ids, attention_mask, past_key_values, None, labels
 
         if type(images) is list or images.ndim == 5:
@@ -138,19 +177,24 @@ class LlavaMetaForCausalLM(ABC):
                 new_input_embeds.append(cur_input_embeds)
                 if labels is not None:
                     new_labels.append(labels[batch_idx])
-                cur_image_idx += 1
+                # cur_image_idx += 1 <- NOTE: NO increment for non-multimodal samples
                 continue
-            
+
             image_token_indices = torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0]
-            
+
             cur_new_input_embeds = []
             if labels is not None:
                 cur_labels = labels[batch_idx]
                 cur_new_labels = []
                 assert cur_labels.shape == cur_input_ids.shape
-                
+
             while image_token_indices.numel() > 0:
-                cur_image_features = image_features[cur_image_idx]                
+                try:                  # TODO: Remove after debugging
+                    cur_image_features = image_features[cur_image_idx]
+                except Exception as e:
+                    print(f"Error: {e}")
+                    breakpoint()
+
                 image_token_start = image_token_indices[0]
                 if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(
                     self.config, "mm_use_im_start_end", False

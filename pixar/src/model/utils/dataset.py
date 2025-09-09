@@ -1,19 +1,18 @@
 import glob
 import os
 import random
+import copy
 
 import cv2
 import json
 import numpy as np
-from PIL import Image
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from pycocotools import mask
 from transformers import CLIPImageProcessor
 
 from model.llava import conversation as conversation_lib
-from model.llava.constants import (DEFAULT_IMAGE_TOKEN, IGNORE_INDEX,
-                                   IMAGE_TOKEN_INDEX)
 from model.llava.mm_utils import tokenizer_image_token
 from model.segment_anything.utils.transforms import ResizeLongestSide
 
@@ -23,11 +22,15 @@ from .reason_seg_dataset import ReasonSegDataset
 from .refer import REFER
 from .refer_seg_dataset import ReferSegDataset
 from .sem_seg_dataset import SemSegDataset
+from .pixar_dataset import PixarDataset
 from .explanatory_seg_datasets_adapter import ExplanatorySegDatasetsAdapter
 from .utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                    DEFAULT_IMAGE_TOKEN, IGNORE_INDEX, IMAGE_TOKEN_INDEX)
+                    DEFAULT_IMAGE_TOKEN, IGNORE_INDEX, IMAGE_TOKEN_INDEX,
+                    INFORMATION_START_TOKEN, INFORMATION_END_TOKEN,
+                    SHORT_QUESTION_LIST, PLUM_ANSWER_LIST,
+                    _info_char_spans, _search_char_spans)
 from .vqa_dataset import VQADataset
-from .utils import SHORT_QUESTION_LIST, PLUM_ANSWER_LIST
+
 
 def collate_fn(
     batch, tokenizer=None, conv_type="llava_v1", use_mm_start_end=True, local_rank=-1
@@ -43,7 +46,12 @@ def collate_fn(
     sampled_classes_list = []
     offset_list = [0]
     cnt = 0
+
+    conv_dataset_names = []
+    conv_search_calls_norm = []
+
     per_token_label_dict_list = []
+    search_calls_norm_list = []
     inferences = []
     dataset_names = []
     for (
@@ -57,6 +65,7 @@ def collate_fn(
         questions,
         sampled_classes,
         per_token_label_dict,  # stores the concept label to mask (e.g., [{'airplane engine': mask, 'airplane wing': mask}])
+        search_calls_norm,
         inference,
         dataset_name,
     ) in batch:
@@ -72,8 +81,13 @@ def collate_fn(
         cnt += len(conversations)
         offset_list.append(cnt)  # e.g., len(conversations[0]) == 4, len(conversations[1]) == 2, offset_list = [0, 4, 6]
         per_token_label_dict_list.append(per_token_label_dict)  # len(per_token_label_dict_list) == bsz
+        search_calls_norm_list.append(search_calls_norm)
         inferences.append(inference)
         dataset_names.append(dataset_name)
+
+        n_convs_this_sample = len(conversations)
+        conv_dataset_names.extend([dataset_name] * n_convs_this_sample)
+        conv_search_calls_norm.extend([search_calls_norm] * n_convs_this_sample)
 
     if use_mm_start_end:
         # replace <image> token
@@ -97,16 +111,17 @@ def collate_fn(
 
     conv = conversation_lib.default_conversation.copy()
     targets = input_ids.clone()
+    qtype_labels = torch.full_like(input_ids, fill_value=IGNORE_INDEX)
 
     if conv_type == "llava_v1":
         sep = conv.sep + conv.roles[1] + ": "
     else:
         sep = "[/INST] "
-        
+
     if (dataset_names[0] in ["textvqa", "gqa", "pope", "cragmm"] and inferences[0] == True):  # handle VQA validation case
         targets = sampled_classes_list[0]
     else:
-        for conversation, target in zip(conversation_list, targets):
+        for conv_idx, (conversation, target) in enumerate(zip(conversation_list, targets)):
             total_len = int(target.ne(tokenizer.pad_token_id).sum())
 
             rounds = conversation.split(conv.sep2)
@@ -127,22 +142,71 @@ def collate_fn(
                     round_len = len(tokenizer(rou).input_ids)
                     instruction_len = len(tokenizer(parts[0]).input_ids) - 2
 
-                target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
+                target[cur_len : cur_len + instruction_len] = IGNORE_INDEX  # ignore the user/inst segment
 
+                is_pixar_conv = (conv_dataset_names[conv_idx] == "pixar")
+                if is_pixar_conv:  # NOTE: also test whether such token-masking indeed helps model stability
+                    assistant_text = parts[1]
+                    enc = tokenizer(assistant_text, add_special_tokens=False, return_offsets_mapping=True)
+                    asst_ids = enc.input_ids
+                    offsets = enc.offset_mapping
+
+                    # find char spans of <information> payloads
+                    info_spans = _info_char_spans(assistant_text)
+                    if len(info_spans) > 0 and len(asst_ids) > 0:
+                        keep_mask = np.ones(len(asst_ids), dtype=bool)
+                        for (s_char, e_char) in info_spans:
+                            for tok_idx, (s_tok, e_tok) in enumerate(offsets):
+                                if e_tok >= s_char and s_tok <= e_char:
+                                    # do not mask tags since tags need to be preserved for retrieval
+                                    tok_slice = assistant_text[s_tok:e_tok]
+                                    if "<" in tok_slice or ">" in tok_slice:
+                                        continue
+                                    keep_mask[tok_idx] = False
+
+                        # project assistant-local token indices -> global indices in `target`
+                        asst_start = cur_len + instruction_len
+                        max_take = min(len(keep_mask), target.size(0) - asst_start)  # guard against overflow just in case
+                        if max_take > 0:
+                            ignore_positions = np.where(~keep_mask[:max_take])[0].tolist()
+                            for pos in ignore_positions:
+                                target[asst_start + pos] = IGNORE_INDEX
+
+                        # <search> token qtype label assignment
+                        search_tok_spans = _search_char_spans(assistant_text)
+                        if len(search_calls_norm_list) == len(conversation_list) and len(search_tok_spans) > 0:
+                            search_call = search_calls_norm_list[conv_idx]
+                            if len(search_call) == 0:
+                                continue
+                            for sc_idx, sc in enumerate(search_call):
+                                if sc["qtype"] == "REGION":
+                                    sc_lbl = 2
+                                elif sc["qtype"] == "IMAGE":
+                                    sc_lbl = 1
+                                else:  # sc["qtype"] == "TEXT"
+                                    sc_lbl = 0
+                                s_char, e_char = search_tok_spans[sc_idx]
+                                if s_char > 0 and assistant_text[s_char - 1].isspace():
+                                    s_char -= 1  # take care of `_<` token to match `<search>`
+                                for tok_idx, (s_tok, e_tok) in enumerate(offsets):
+                                    if s_tok >= s_char and e_tok <= e_char:
+                                        qtype_labels[conv_idx, asst_start + tok_idx] = sc_lbl
                 cur_len += round_len
             target[cur_len:] = IGNORE_INDEX
 
             if cur_len < tokenizer.model_max_length:
                 assert cur_len == total_len
-    
-    if inferences[0] == False:
-        truncate_len = tokenizer.model_max_length - 255  # hack for adding 255 image patch tokens (max_len = 512)
 
+    if inferences[0] == False:
+        im_start_id = tokenizer.convert_tokens_to_ids(DEFAULT_IM_START_TOKEN)
+        has_image_token = (input_ids == im_start_id).any().item()
+        reserve = 255 if has_image_token else 0
+        truncate_len = tokenizer.model_max_length - reserve  # hack for adding 255 image patch tokens
         if input_ids.shape[1] > truncate_len:
             input_ids = input_ids[:, :truncate_len]
             targets = targets[:, :truncate_len]
             attention_masks = attention_masks[:, :truncate_len]
-            
+
     # construct the BIO tag scheme label here following the input_ids construction
     per_token_labels_list = []   # will be a list of lists (one per conversation)
     mask_positions_in_input_ids = []  # list of starting token indices for each conversation
@@ -156,23 +220,23 @@ def collate_fn(
         end = offset_list[batch_idx + 1]
         # NOTE: len(part_to_mask_list) is the number of conversations
         # each dict (e.g., part_to_mask_list[i]) contains part_text as key and the corresponding mask as value
-        # part_to_mask_list[i] can have multiple parts (for 'explanatory_seg'), or single part (for 'reason_seg', 'sem_seg', 'refer_seg')
+        # part_to_mask_list[i] can have multiple parts (for 'explanatory_seg'), or single part (for 'reason_seg', 'sem_seg', 'refer_seg') per conversation
         part_to_mask_list = per_token_label_dict_list[batch_idx]  # e.g., [{'engine': mask, 'wing': mask}]
-        
+
         for conv_idx in range(start, end):
             part_mask_idx = conv_idx - start
             part_to_mask = part_to_mask_list[part_mask_idx]
-            
+
             conversation = conversation_list[conv_idx]
             per_token_labels = [BIO_NO_LBL] * input_ids.size(1)
             mask_positions = set()
-            
+
             if len(part_to_mask_list) != len(conversation_list[start:end]):
                 print(f">> Warning: len(part_to_mask_list) != len(conversation_list[start:end])")
                 print(f">> part_to_mask_list: {part_to_mask_list}")
                 print(f">> conversation_list[start:end]: {conversation_list[start:end]}")
-                exit()
-            
+                breakpoint()
+
             ASSISTANT_START_TOK = 'ASSISTANT:'
             TOK_START_CHAR = '▁'
             if len(part_to_mask) != 0:
@@ -191,7 +255,7 @@ def collate_fn(
                     assistant_str_ids = assistant_start_tok_ids
                     if sub_str_ids == assistant_str_ids:
                         break
-                
+
                 for part_text in sorted(part_to_mask, key=len, reverse=True):
                     part_token_ids = tokenizer(part_text)['input_ids'][1:]  # skip the <s> token
                     part_token_ids_tokens = tokenizer.convert_ids_to_tokens(part_token_ids)
@@ -212,7 +276,7 @@ def collate_fn(
                             mask_positions.add(j)
                             substr_found = True
                             break  # Break after finding the first valid match for this part_text
-                    
+
                     if not substr_found:
                         pass
 
@@ -248,6 +312,7 @@ def collate_fn(
         "conversation_list": conversation_list,
         "per_token_labels": per_token_labels_tensor,  # BIO ids per token (same dim as input_ids)
         "mask_positions_in_input_ids": mask_positions_in_input_ids,  # list of lists of starting token indices per sample
+        "qtype_labels": qtype_labels,  # qtype labels per <search> token (same dim as input_ids)
     }
 
 
@@ -256,10 +321,6 @@ class HybridDataset(torch.utils.data.Dataset):
     pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
     img_size = 1024
     ignore_label = 255
-    
-        
-    # TODO: Let's add GranD dataset here!
-
 
     def __init__(
         self,
@@ -275,15 +336,14 @@ class HybridDataset(torch.utils.data.Dataset):
         sample_rate=[9, 5, 5, 1],
         sem_seg_data="ade20k||cocostuff||partimagenet||pascal_part||paco_lvis||mapillary",
         refer_seg_data="refclef||refcoco||refcoco+||refcocog",
-        vqa_data="llava_instruct_150k",
+        vqa_data="llava_v1_5_mix665k",
         reason_seg_data="ReasonSeg|train",
-        explanatory_seg_datasets: ExplanatorySegDatasetsAdapter = None,
+        pixar_data="oven||infoseek||aokvqa||okvqa||textvqa||webqa",
         explanatory=0.1,
     ):
         self.exclude_val = exclude_val
         self.dataset = dataset
         self.samples_per_epoch = samples_per_epoch
-        self.explanatory = explanatory
         self.num_classes_per_sample = num_classes_per_sample
         sample_rate = np.array(sample_rate)
         self.sample_rate = sample_rate / sample_rate.sum()
@@ -296,7 +356,18 @@ class HybridDataset(torch.utils.data.Dataset):
 
         self.all_datasets = []
         for dataset in self.datasets:
-            if dataset == "sem_seg":
+            if dataset == "pixar":
+                self.all_datasets.append(
+                    PixarDataset(
+                        base_image_dir,
+                        tokenizer,
+                        vision_tower,
+                        precision,
+                        image_size,
+                        pixar_data,
+                    )
+                )
+            elif dataset == "sem_seg":
                 self.all_datasets.append(
                     SemSegDataset(
                         base_image_dir,
@@ -353,22 +424,24 @@ class HybridDataset(torch.utils.data.Dataset):
                         explanatory,
                     )
                 )
-        
-        if explanatory_seg_datasets:
-            self.all_datasets.append(explanatory_seg_datasets)
 
     def __len__(self):
-        return len(self.all_datasets[0]) if self.dataset == 'explanatory_seg' else self.samples_per_epoch
+        if len(self.all_datasets) == 1:
+            return len(self.all_datasets[0])
+        return self.samples_per_epoch
 
     def __getitem__(self, idx):
         if len(self.all_datasets) == 1:
             ind = 0
+            data = self.all_datasets[0]
+            local_idx = idx
         else:
             ind = np.random.choice(list(range(len(self.datasets))), p=self.sample_rate)
-        data = self.all_datasets[ind]
+            data = self.all_datasets[ind]
+            local_idx = np.random.randint(len(data))
+
         inference = False
-        # return *data[0], inference, self.datasets[ind]
-        return *data[idx], inference, self.datasets[ind]
+        return *data[local_idx], inference, self.datasets[ind]
 
 
 class ValDataset(torch.utils.data.Dataset):
@@ -389,7 +462,7 @@ class ValDataset(torch.utils.data.Dataset):
         splits = val_dataset.split("|")
         self.short_question_list = SHORT_QUESTION_LIST
         self.answer_list = PLUM_ANSWER_LIST  # corresponds to ANSWER_LIST in LISA
-        
+
         if len(splits) == 2:
             ds, split = splits
             if ds == "reason_seg":
@@ -400,7 +473,7 @@ class ValDataset(torch.utils.data.Dataset):
                 self.reformulated_text_path = os.path.join(base_image_dir, ds, "ReasonSeg", split, "val_reformulated_responses.json")
                 with open(self.reformulated_text_path, "r") as f:
                     self.reformulated_text_dict = json.load(f)
-                    
+
             elif ds == "ade20k":
                 with open("utils/ade20k_classes.json", "r") as f:
                     ade20k_classes = json.load(f)
@@ -414,7 +487,7 @@ class ValDataset(torch.utils.data.Dataset):
                 self.classes = ade20k_classes
                 self.labels = ade20k_labels
                 self.data_type = "sem_seg"
-                
+
             elif ds == "cocostuff":
                 cocostuff_classes = []
                 with open("utils/cocostuff_classes.txt") as f:
@@ -432,7 +505,7 @@ class ValDataset(torch.utils.data.Dataset):
                 self.cocostuff_class2index = {
                     c: i for i, c in enumerate(cocostuff_classes)
                 }
-                
+
             elif ds == "mapillary":
                 mapillary_data_root = os.path.join(base_image_dir, "mapillary")
                 with open(os.path.join(mapillary_data_root, "config_v2.0.json")) as f:
@@ -447,10 +520,10 @@ class ValDataset(torch.utils.data.Dataset):
                 self.classes = mapillary_classes
                 self.labels = mapillary_labels
                 self.data_type = "sem_seg"
-                
+
             elif ds == "paco_lvis":
                 raise NotImplementedError("paco_lvis is not implemented yet")
-                
+
         elif len(splits) == 3:  # refer_seg
             ds, splitBy, split = splits
             DATA_DIR = os.path.join(base_image_dir, "refer_seg")
@@ -539,7 +612,7 @@ class ValDataset(torch.utils.data.Dataset):
             image = cv2.imread(image_path)
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             is_sentence = False
-        
+
         elif self.data_type == "sem_seg":
             image_path = self.images[idx]
             label_path = self.labels[idx]
@@ -553,10 +626,9 @@ class ValDataset(torch.utils.data.Dataset):
                 for c, i in self.cocostuff_class2index.items():
                     if "-" in c:
                         label[label == i] = 255
-            
+
             image = cv2.imread(image_path)
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            
             image_clip = self.clip_image_processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
             image = self.transform.apply_image(image)  # preprocess image for sam
             resize = image.shape[:2]
@@ -565,7 +637,7 @@ class ValDataset(torch.utils.data.Dataset):
                 unique_label.remove(255)
             if len(unique_label) == 0:
                 return self.__getitem__(0)
-            
+
             sampled_classes = [self.classes[class_id] for class_id in unique_label]
             questions = []
             answers = []
@@ -577,14 +649,14 @@ class ValDataset(torch.utils.data.Dataset):
                 questions.append(question_template.format(class_name=text.lower()))
                 answer_template = random.choice(self.answer_list)
                 answers.append(answer_template.format(class_name=text.lower()))
-                
+
                 # For ["ade20k", "cocostuff", "mapillary"], we need the class_ids to be in the label mask
                 class_id = self.classes.tolist().index(sampled_cls)
-                class_ids.append(class_id)   
-            
+                class_ids.append(class_id)
+
             is_sentence = False
             sampled_sents = sampled_classes
-            
+
         else:  # reason_seg
             image_path = self.images[idx]
             image = cv2.imread(image_path)
@@ -595,7 +667,11 @@ class ValDataset(torch.utils.data.Dataset):
             mask_json, sampled_sents, is_sentence = get_mask_from_json(json_path, image)
             sampled_sents = [sampled_sents[0]]
 
-        # construct conversations based on the sampled_sents
+
+        ####
+        # TODO: After implementing the self.data_type == "sem_seg", we need to revise the conversations logic
+        ####
+
         conversations = []
         conv = conversation_lib.default_conversation.copy()
         i = 0
@@ -620,7 +696,7 @@ class ValDataset(torch.utils.data.Dataset):
                     DEFAULT_IMAGE_TOKEN
                     + "\n What is {} in this image? Please highlight the region in the image.".format(
                         text
-                    ), # output = The orange car with 5 wheels in the iamge ...
+                    ),
                 )
                 if self.data_type == "reason_seg":
                     chosen_response = random.choice(response_texts)
@@ -628,10 +704,10 @@ class ValDataset(torch.utils.data.Dataset):
                     chosen_response_texts.append(chosen_response)
                 else:
                     conv.append_message(conv.roles[1], text)
-                
+
             conversations.append(conv.get_prompt())
             i += 1
-            
+
         # preprocess image for clip
         image_clip = self.clip_image_processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
 
@@ -664,7 +740,7 @@ class ValDataset(torch.utils.data.Dataset):
                 )  # sometimes there are multiple binary map (corresponding to multiple segs)
                 m = m.astype(np.uint8)  # convert to np.uint8
                 masks.append(m)
-        
+
         elif self.data_type == "sem_seg":
             if self.ds in ["paco_lvis", "pascal_part"]:
                 pass # TODO: Implement this after ade20k - need `sampled_anns` loaded for this
@@ -679,11 +755,11 @@ class ValDataset(torch.utils.data.Dataset):
         masks = torch.from_numpy(masks)
         labels = torch.ones(masks.shape[1], masks.shape[2]) * self.ignore_label
         inference = True
-        
+
         sampled_sents = chosen_response_texts if self.data_type == "reason_seg" else sampled_sents
-        
+
         per_token_label_dict = [{k: v} for k, v in zip(sampled_sents, masks)]
-        
+
         return (
             image_path,
             image,
@@ -695,6 +771,7 @@ class ValDataset(torch.utils.data.Dataset):
             None,
             sampled_sents,
             per_token_label_dict,
+            None,
             inference,
             self.data_type
         )

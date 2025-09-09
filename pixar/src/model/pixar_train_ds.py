@@ -14,6 +14,7 @@ from jsonargparse import Namespace, ArgumentParser
 import deepspeed
 import numpy as np
 import torch
+import torch.distributed as dist
 import tqdm
 import transformers
 from peft import LoraConfig, get_peft_model
@@ -28,33 +29,28 @@ except ImportError:
     def GatheredParameters(params, modifier_rank=None):
         yield
 
-from model.PLUM import PLUMForCausalLM
+from model.PIXAR import PIXARForCausalLM
 from model.llava import conversation as conversation_lib
 from utils.dataset import HybridDataset, ValDataset, collate_fn
-from utils.explanatory_seg_dataset import ExplanatorySegDataset
-from utils.explanatory_seg_datasets_adapter import ExplanatorySegDatasetsAdapter
-
-# NOTE: ExplanatorySegDatasetsAdapter turns ExplanatorySegInstance to a tuple
-# NOTE: Make sure you fix it.
 
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          AverageMeter, ProgressMeter, Summary, dict_to_cuda,
                          intersectionAndUnionGPU)
-from utils.question_type import QuestionType
+
+from utils.pixar_dataset import PixarDataset
+
 
 # add IoUEvaluator evaluation functionality
-sys.path.append(os.path.abspath(os.path.join(__file__, '../../..')))
+sys.path.append(os.path.abspath(os.path.join(__file__, '../..')))
 from evaluation.prediction import Prediction, Predictions
 from evaluation.rle_dict import get_mask_rle_dicts
 from evaluation.evaluators import (
-    IoUEvaluator, IoUEvaluatorConfig, MaskMatchingStrategy,
-    PartTextEvaluator, PartTextEvaluatorConfig,
-    MCTextEvaluator, Reduction
+    IoUEvaluator, IoUEvaluatorConfig, MaskMatchingStrategy, Reduction
 )
 
 
 def parse_args(args):
-    parser = ArgumentParser(description="PLUM Model Training")
+    parser = ArgumentParser(description="PIXAR Model Training")
     parser.add_argument("--local_rank", default=0, type=int, help="node rank")
     parser.add_argument(
         "--version", default="liuhaotian/llava-llama-2-13b-chat-lightning-preview"
@@ -69,7 +65,7 @@ def parse_args(args):
         help="precision for inference",
     )
     parser.add_argument("--image_size", default=1024, type=int, help="image size")
-    parser.add_argument("--model_max_length", default=1536, type=int)  # Originally, 512
+    parser.add_argument("--model_max_length", default=1024, type=int)  # Originally, 512
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument(
         "--vision-tower", default="openai/clip-vit-large-patch14", type=str
@@ -92,31 +88,27 @@ def parse_args(args):
     parser.add_argument(
         "--explanatory_seg_data", action="store_true"
     )
-    
+
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project-name", default="plum-training")
-    parser.add_argument("--vqa_data", default="llava_instruct_150k", type=str)  # llava_instruct_150k ; llava_v1_5_mix665k
+    parser.add_argument("--vqa_data", default="llava_v1_5_mix665k", type=str)  # llava_instruct_150k ; llava_v1_5_mix665k
     parser.add_argument("--reason_seg_data", default="ReasonSeg|train", type=str)
-    parser.add_argument("--val_dataset", default="ReasonSeg|val", type=str)
+    parser.add_argument("--val_dataset", default="ade20k|validation", type=str)
     parser.add_argument("--dataset_dir", default="./dataset", type=str)
-    
+
     # Partonomy args
-    parser.add_argument("--partonomy_train_dataset_path", default="/shared/nas2/blume5/sp25/partonomy/partonomy_private/data/partonomy_descriptors/{dataset_split}/{dataset_split}_qa_pairs_train.json", type=str)
-    parser.add_argument("--partonomy_val_dataset_path", default="/shared/nas2/blume5/sp25/partonomy/partonomy_private/data/partonomy_descriptors/{dataset_split}/{dataset_split}_qa_pairs_val.json", type=str)
-    parser.add_argument("--partonomy_dataset_split", default="", type=str)  # e.g., "partimagenet|pascal_part|paco_lvis|partonomy"
-    parser.add_argument("--partonomy_question_type", default="identification_with_label", type=str)
+    parser.add_argument("--pixar_data", default="", type=str, help="oven||infoseek||aokvqa||okvqa||textvqa||webqa")
     parser.add_argument("--sample_one_question_per_image", action="store_true")
     parser.add_argument("--random_seed", default=42, type=int)
-    
+
     # Evaluators
     parser.add_argument('--metrics.iou_evaluator_config', default=IoUEvaluatorConfig(), type=IoUEvaluatorConfig) # NOTE: Change to either reduction='macro' or reduction='micro'
-    parser.add_argument('--metrics.part_text_evaluator_config', default=PartTextEvaluatorConfig(), type=PartTextEvaluatorConfig)
-    parser.add_argument('--predictions_path', default='/shared/nas2/jk100/partonomy_private/results/predictions.json', type=str)
-    parser.add_argument('--output_predictions', action='store_true', default=False)
-    
+    parser.add_argument('--predictions_path', default='/home/jeonghkim/projects/pixar/pixar/src/results/predictions.json', type=str)
+    parser.add_argument('--output_predictions', action='store_true', default=True)
+
     # Training args
     parser.add_argument("--log_base_dir", default="./runs", type=str)
-    parser.add_argument("--exp_name", default="plum", type=str)
+    parser.add_argument("--exp_name", default="pixar", type=str)
     parser.add_argument("--epochs", default=10, type=int)
     parser.add_argument("--steps_per_epoch", default=500, type=int)
     parser.add_argument(
@@ -141,19 +133,15 @@ def parse_args(args):
     parser.add_argument("--seg_cls_loss_per_cls_weight", default=[0.1, 1.0, 1.0], type=list, help="per class weight for seg_cls_loss")
     parser.add_argument("--use_teacher_ref", action="store_true", default=False)
     parser.add_argument("--use_bidir_bio", action="store_true", default=False)
-    parser.add_argument("--use_cross_attn_bio", action="store_true", default=False)
-    parser.add_argument("--use_hinge_loss", action="store_true", default=False)
-    parser.add_argument("--use_crf_bio", action="store_true", default=False)
-    parser.add_argument("--pred_binary_span", action="store_true", default=False)
     parser.add_argument("--focal_tversky_alpha", default=0.7, type=float)
     parser.add_argument("--focal_tversky_beta", default=0.3, type=float)
     parser.add_argument("--limit_batches", default=None, type=int)
     parser.add_argument("--use_feedback_loop", action="store_true", default=False)
-    
+
     # bidirectionalencoderblock params
     parser.add_argument("--bidir_nhead", default=8, type=int)
     parser.add_argument("--bidir_dim_feedforward", default=2048, type=int)
-    
+
     parser.add_argument("--lora_alpha", default=16, type=int)
     parser.add_argument("--lora_dropout", default=0.05, type=float)
     parser.add_argument("--lora_target_modules", default="q_proj,v_proj", type=str)
@@ -181,10 +169,10 @@ def parse_args(args):
         type=str,
         choices=["llava_v1", "llava_llama_2"],
     )
-    
+
     parser.add_argument("--debug", action="store_true", default=False)
-    # Add distributed argument to prevent jsonargparse validation error
     parser.add_argument("--distributed", action="store_true", default=False, help="whether training is distributed across multiple GPUs")
+    parser.add_argument("--eval_zero_shot_ckpt", action="store_true", default=False, help="When turned on, evaluate before the start of the first training epoch")
 
     return parser.parse_args(args), parser
 
@@ -192,80 +180,61 @@ def parse_args(args):
 def main(args):
     args, parser = parse_args(args)
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
+
+    # set up run_name and run_ckpt_path
+    run_name = (f"{args.exp_name}_maxlen{args.model_max_length}"
+                    f"_epochs{args.epochs}_bsz{args.batch_size}"
+                    f"_bce_loss_{args.bce_loss_weight}_kld_loss_{args.kld_loss_weight}"
+                    f"_{args.dice_type}_loss_{args.dice_loss_weight}_{args.dice_scale_factor}_lr{args.lr}"
+                )
+    run_ckpt_path = (f"{args.exp_name}_maxlen{args.model_max_length}"
+                        f"_epochs{args.epochs}"
+                        f"_kld_loss_{int(args.kld_loss_weight)}"
+                        f"_{args.dice_type}_loss_{int(args.dice_loss_weight)}"
+                    )
+
+    # add additional run_name and run_ckpt_path
+    if args.use_teacher_ref:
+        run_name += "_teacher"
+        run_ckpt_path += "_teacher"  # e.g., pixar-13b_kld_0_dice_4_accum_10_maxlen512_epochs50_segloss_2_bce_loss_2_kld_loss_0_dice_loss_4_teacher
+    if args.use_bidir_bio:
+        run_name = (f"{args.exp_name}_bidirbio_{args.bidir_dim_feedforward}_maxlen{args.model_max_length}"
+                    f"_epochs{args.epochs}_bsz{args.batch_size}"
+                    f"_lr{args.lr}"
+                    )
+        run_ckpt_path = (f"{args.exp_name}_bidirbio_{args.bidir_dim_feedforward}_maxlen{args.model_max_length}"
+                            f"_epochs{args.epochs}"
+                        )
+        run_name += "_bidir_bio"
+        run_ckpt_path += "_bidir_bio"
+    if args.use_feedback_loop:
+        run_name += "_feedback_loop"
+        run_ckpt_path += "_feedback_loop"
+    if args.train_mask_prompt_encoder:
+        run_name += "_train_prompt_enc"
+        run_ckpt_path += "_train_prompt_enc"
+    if args.focal_tversky_alpha != 0.7 and args.focal_tversky_beta != 0.3:
+        run_name += f"_focal_tversky_{str(args.focal_tversky_alpha).replace('.', '')}_{str(args.focal_tversky_beta) .replace('.', '')}"
+        run_ckpt_path += f"_focal_tversky_{str(args.focal_tversky_alpha).replace('.', '')}_{str(args.focal_tversky_beta).replace('.', '')}"
+    if args.pixar_data:
+        run_name += f"_pixar_{'_'.join(args.pixar_data.split('||'))}"
+        run_ckpt_path += f"_pixar_{'_'.join(args.pixar_data.split('||'))}"
+
+    sample_rates = args.sample_rates.split(",")
+    run_name += f"_srates_{'_'.join(sample_rates)}"
+    run_ckpt_path += f"_srates_{'_'.join(sample_rates)}"
+
+    print(">> (train) run_name: ", run_name)
+    print(">> (train) run_ckpt_path: ", run_ckpt_path)
+
     if args.local_rank == 0:
         os.makedirs(args.log_dir, exist_ok=True)
         writer = SummaryWriter(args.log_dir)
-        
-        run_name = (f"{args.exp_name}_maxlen{args.model_max_length}"
-                      f"_epochs{args.epochs}_bsz{args.batch_size}"
-                      f"_bce_loss_{args.bce_loss_weight}_kld_loss_{args.kld_loss_weight}"
-                      f"_{args.dice_type}_loss_{args.dice_loss_weight}_{args.dice_scale_factor}_lr{args.lr}"
-                    )
-        run_ckpt_path = (f"{args.exp_name}_maxlen{args.model_max_length}"
-                            f"_epochs{args.epochs}"
-                            f"_kld_loss_{int(args.kld_loss_weight)}"
-                            f"_{args.dice_type}_loss_{int(args.dice_loss_weight)}"
-                        )
-        if args.use_teacher_ref:
-            run_name += "_teacher"
-            run_ckpt_path += "_teacher"  # e.g., plum-13b_kld_0_dice_4_accum_10_maxlen512_epochs50_segloss_2_bce_loss_2_kld_loss_0_dice_loss_4_teacher
-        if args.use_bidir_bio:
-            run_name = (f"{args.exp_name}_bidirbio_{args.bidir_dim_feedforward}_maxlen{args.model_max_length}"
-                        f"_epochs{args.epochs}_bsz{args.batch_size}"
-                        f"_lr{args.lr}"
-                        )
-            run_ckpt_path = (f"{args.exp_name}_bidirbio_{args.bidir_dim_feedforward}_maxlen{args.model_max_length}"
-                             f"_epochs{args.epochs}"
-                            )
-            run_name += "_bidir_bio"
-            run_ckpt_path += "_bidir_bio"
-        if args.use_crf_bio:
-            run_name += "_crf_bio"
-            run_ckpt_path += "_crf_bio"
-        if args.use_hinge_loss:
-            run_name += "_hinge_loss"
-            run_ckpt_path += "_hinge_loss"
-        if args.use_feedback_loop:
-            run_name += "_feedback_loop"
-            run_ckpt_path += "_feedback_loop"
-        if args.use_cross_attn_bio:
-            run_name += "_cross_attn_bio"
-            run_ckpt_path += "_cross_attn_bio"
-        if args.explanatory_seg_data:
-            run_name += "_exp_seg"
-            run_ckpt_path += "_exp_seg"
-        if args.train_mask_prompt_encoder:
-            run_name += "_train_prompt_enc"
-            run_ckpt_path += "_train_prompt_enc"
-        if args.pred_binary_span:
-            if len(args.seg_cls_loss_per_cls_weight) > 2:
-                args.seg_cls_loss_per_cls_weight = [0.1, 1.0]
-            run_name += "_binary_span"
-            run_ckpt_path += "_binary_span"
-        if args.vision_tower == "naclip":
-            run_name += "_naclip"
-            run_ckpt_path += "_naclip"
-        if args.explanatory_seg_data:
-            run_name += "_exp_seg_val"
-            run_ckpt_path += "_exp_seg_val"
-        if args.focal_tversky_alpha != 0.7 and args.focal_tversky_beta != 0.3:
-            run_name += f"_focal_tversky_{str(args.focal_tversky_alpha).replace('.', '')}_{str(args.focal_tversky_beta) .replace('.', '')}"
-            run_ckpt_path += f"_focal_tversky_{str(args.focal_tversky_alpha).replace('.', '')}_{str(args.focal_tversky_beta).replace('.', '')}"
-        if args.partonomy_dataset_split:
-            run_name += f"_partonomy_{'_'.join(args.partonomy_dataset_split.split('|'))}"
-            run_ckpt_path += f"_partonomy_{'_'.join(args.partonomy_dataset_split.split('|'))}"
-        
-        sample_rates = args.sample_rates.split(",")
-        run_name += f"_srates_{'_'.join(sample_rates)}"
-        run_ckpt_path += f"_srates_{'_'.join(sample_rates)}"
-        
-        print(">> (train) run_name: ", run_name)
-        print(">> (train) run_ckpt_path: ", run_ckpt_path)
-        
+
         # wandb logging
         import dataclasses
         from enum import Enum
-        
+
         config_for_wandb = {}
         for arg_key, arg_value in vars(args).items():
             if dataclasses.is_dataclass(arg_value) and not isinstance(arg_value, type):
@@ -276,11 +245,6 @@ def main(args):
                     for k_inner, v_inner in dict_representation.items():
                         if isinstance(v_inner, Enum):
                             sanitized_dict[k_inner] = v_inner.name
-                        # elif dataclasses.is_dataclass(v_inner) and not isinstance(v_inner, type): # Optional: handle nested dataclasses
-                        #     # This part might need more robust handling if deeply nested structures with enums exist
-                        #     nested_dc_dict = dataclasses.asdict(v_inner)
-                        #     sanitized_nested_dict = {nk: nv.name if isinstance(nv, Enum) else nv for nk, nv in nested_dc_dict.items()}
-                        #     sanitized_dict[k_inner] = sanitized_nested_dict
                         else:
                             sanitized_dict[k_inner] = v_inner
                     config_for_wandb[arg_key] = sanitized_dict
@@ -291,9 +255,9 @@ def main(args):
                  config_for_wandb[arg_key] = arg_value.name
             else:
                 config_for_wandb[arg_key] = arg_value
-                
+
         wandb.init(
-            project=args.wandb_project_name, 
+            project=args.wandb_project_name,
             name=run_name,
             config=config_for_wandb # Use the sanitized config
         )
@@ -305,11 +269,10 @@ def main(args):
             with open(metrics_path, "r") as f:
                 epoch_metrics = json.load(f)
                 latest_epoch = max(map(int, list(epoch_metrics.keys())))
-
     else:
         writer = None
 
-    # Create model
+    # model init
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.version,
         cache_dir=None,
@@ -341,11 +304,7 @@ def main(args):
         "use_mm_start_end": args.use_mm_start_end,
         "use_teacher_ref": args.use_teacher_ref,
         "use_bidir_bio": args.use_bidir_bio,
-        "use_crf_bio": args.use_crf_bio,
-        "use_hinge_loss": args.use_hinge_loss,
         "use_feedback_loop": args.use_feedback_loop,
-        "pred_binary_span": args.pred_binary_span,
-        "use_cross_attn_bio": args.use_cross_attn_bio,
         "train_mask_prompt_encoder": args.train_mask_prompt_encoder,
         "focal_tversky_alpha": args.focal_tversky_alpha,
         "focal_tversky_beta": args.focal_tversky_beta,
@@ -357,9 +316,9 @@ def main(args):
         torch_dtype = torch.bfloat16
     elif args.precision == "fp16":
         torch_dtype = torch.half
-    
+
     # model initialization
-    model = PLUMForCausalLM.from_pretrained(
+    model = PIXARForCausalLM.from_pretrained(
         args.version, torch_dtype=torch_dtype, low_cpu_mem_usage=False, **model_args
     )
     model.config.eos_token_id = tokenizer.eos_token_id
@@ -372,7 +331,7 @@ def main(args):
     model.get_model().initialize_vision_modules(model.get_model().config)
     vision_tower = model.get_model().get_vision_tower()
     vision_tower.to(dtype=torch_dtype, device=torch.device("cuda", args.local_rank))
-    model.get_model().initialize_plum_modules(model.get_model().config, **model_args)
+    model.get_model().initialize_pixar_modules(model.get_model().config, **model_args)
 
     # Freeze the vision tower and mm_projector
     for p in vision_tower.parameters():
@@ -427,15 +386,13 @@ def main(args):
         model.print_trainable_parameters()
 
     model.resize_token_embeddings(len(tokenizer))
-    
+
     params_to_train = ["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs", "token_to_mask_fcs"]
     print(">> model.config.train_mask_prompt_encoder: ", model.config.train_mask_prompt_encoder)
     if model.config.train_mask_prompt_encoder:
         params_to_train.append("prompt_encoder")
     if model.use_bidir_bio:
         params_to_train.append("bio_encoder")
-    if model.use_crf_bio:
-        params_to_train.append("crf")
     if model.use_cross_attn_bio:
         params_to_train.append("bio_cross_attn")
     if model.use_feedback_loop:
@@ -454,11 +411,6 @@ def main(args):
 
     if args.use_bidir_bio:
         model.bio_encoder._init_weights()
-        if args.use_crf_bio:
-            model.crf.reset_parameters()
-
-    if args.use_cross_attn_bio:
-        model.bio_cross_attn.initialize_weights()
 
     if model.use_teacher_ref and not args.eval_only:  # initialize the frozen teacher_llm
         model.initialize_teacher_llm()
@@ -468,65 +420,27 @@ def main(args):
 
     world_size = torch.cuda.device_count()
     args.distributed = world_size > 1
-    
-    if args.vision_tower == "naclip":
-        vision_tower_for_image_preprocessing = "openai/clip-vit-large-patch14"
-    else:
-        vision_tower_for_image_preprocessing = args.vision_tower
-    
+
+    vision_tower_for_image_preprocessing = args.vision_tower
+
     # setup partonomy dataset for training
-    explanatory_seg_dataset_adapter = None
-    if args.explanatory_seg_data and args.zero_shot_ckpt_path:
-        print(">> (plum_train_ds) loading ExplanatorySegDataset...")
-        train_question_types = [  # NOTE: We only train on with label case
-            # QuestionType.IDENTIFICATION,
-            QuestionType.IDENTIFICATION_WITH_LABEL,
-            # QuestionType.POSITIVE,
-            QuestionType.POSITIVE_WITH_LABEL,
-            # QuestionType.NEGATIVE,
-            QuestionType.NEGATIVE_WITH_LABEL,
-            # QuestionType.DIFFERENCE,
-            # QuestionType.DIFFERENCE_WITH_LABEL
-            # QuestionType.PART_TO_WHOLE,
-            # QuestionType.WHOLE_TO_PART,
-        ]
-        dataset_splits = args.partonomy_dataset_split.split("|")  # 'partimagenet|pascal_part|paco_lvis|partonomy'
-        
+    pixar_dataset_adapter = None
+    if args.pixar_data and args.zero_shot_ckpt_path:
+        print(">> (pixar_train_ds) loading Pixar Validation Dataset...")
+        dataset_splits = args.pixar_data.split("||")  # 'infoseek|oven|aokvqa|okvqa|textvqa|webqa'
         for dataset_split in dataset_splits:
-            if dataset_split == 'partonomy':
-                train_paths = []
-            else:
-                train_paths = [args.partonomy_train_dataset_path.format(dataset_split=dataset_split)]
-                
-        explanatory_seg_datasets = []
-        for question_type in train_question_types:
-            print(">> (plum_train_ds) train_question_types: ", question_type)
-            explanatory_seg_datasets.extend(
-                [
-                    ExplanatorySegDataset(
-                        path, 
-                        tokenizer, 
-                        vision_tower_for_image_preprocessing, 
-                        question_type=question_type, 
-                        sample_one_question_per_image=args.sample_one_question_per_image, 
-                        random_seed=args.random_seed
-                    ) 
-                    for path in train_paths
-                ]
-            )
-        explanatory_seg_dataset_adapter = ExplanatorySegDatasetsAdapter(explanatory_seg_datasets, indexing_strategy='concatenate')
-        args.sample_rates = '1'  # e.g., ['explanatory_seg'] with a sample_rate = 1
+            pass  # TODO: Implement Pixar validation Dataset loading here
 
     # load the training dataset
     warmup_num_steps = 100
     total_num_steps = args.epochs * args.steps_per_epoch
-    if args.eval_only or args.partonomy_dataset_split == 'partonomy':
+    if args.eval_only:
         train_dataset = None
     else:
         samples_per_epoch = args.batch_size * args.grad_accumulation_steps * args.steps_per_epoch * world_size
         total_num_steps = args.epochs * args.steps_per_epoch
         warmup_num_steps = 100
-            
+
         train_dataset = HybridDataset(
                 args.dataset_dir,
                 tokenizer,
@@ -542,41 +456,23 @@ def main(args):
                 refer_seg_data=args.refer_seg_data,
                 vqa_data=args.vqa_data,
                 reason_seg_data=args.reason_seg_data,
-                explanatory_seg_datasets=explanatory_seg_dataset_adapter,
-                explanatory=args.explanatory,
+                pixar_data=args.pixar_data,
         )
         print(
             f"Training with {len(train_dataset)} examples."
         )
 
     if args.no_eval == False:
-        if args.explanatory_seg_data and args.zero_shot_ckpt_path:
-            dataset_splits = args.partonomy_dataset_split.split("|")  # 'partimagenet|pascal_part|paco_lvis|partonomy'
-            #dataset_splits = ['partimagenet']
-            explanatory_seg_val_datasets = []
-            for dname in dataset_splits:
-                explanatory_seg_val_dataset = ExplanatorySegDataset(
-                    dataset_path=args.partonomy_val_dataset_path.format(dataset_split=dname),
-                    tokenizer=tokenizer,
-                    vision_tower=args.vision_tower,
-                    question_type=QuestionType.IDENTIFICATION_WITH_LABEL,  # XXX
-                    image_size=args.image_size,
-                    model_str='plum'
-                )
-                explanatory_seg_val_datasets.append(explanatory_seg_val_dataset)
-            val_dataset = ExplanatorySegDatasetsAdapter(explanatory_seg_val_datasets, indexing_strategy='concatenate', inference=True)
-            print(f">> ExplanatorySegDataset ({args.partonomy_question_type}): Validating with {len(val_dataset)} examples.")
-        else:
-            val_dataset = ValDataset(
-                args.dataset_dir,
-                tokenizer,
-                vision_tower_for_image_preprocessing,
-                args.val_dataset,
-                args.image_size,
-            )
-            print(
-                f"Validating with {len(val_dataset)} examples."
-            )
+        val_dataset = ValDataset(
+            args.dataset_dir,
+            tokenizer,
+            vision_tower_for_image_preprocessing,
+            args.val_dataset,
+            args.image_size,
+        )
+        print(
+            f"Validating with {len(val_dataset)} examples."
+        )
     else:
         val_dataset = None
         print(f"Training with {len(train_dataset)} examples.")
@@ -616,8 +512,20 @@ def main(args):
             "reduce_scatter": True,
             "reduce_bucket_size": 5e8,
             "allgather_bucket_size": 5e8,
+            "ignore_unused_parameters": True
         },
+        "ddp": {
+            "find_unused_parameters": True
+        }
     }
+
+    # # TODO: Unit test the collate_fn with HybridDataset - delete this block after testing  ####
+    # batch = [train_dataset[i] for i in range(args.batch_size)]
+    # out = collate_fn(batch, tokenizer, args.conv_type, args.use_mm_start_end, args.local_rank)
+
+    # breakpoint()
+    # #########################################################
+
     model_engine, optimizer, train_loader, scheduler = deepspeed.initialize(
         model=model,
         model_parameters=model.parameters(),
@@ -631,32 +539,22 @@ def main(args):
         ),
         config=ds_config,
     )
-    
+
     if args.debug:
         def _engine_evaluate(self, **kwargs):
             """
-            This runs on the DeepSpeedEngine.  
+            This runs on the DeepSpeedEngine.
             It gathers the ZeRO shards, then delegates to the plain model.
             """
             with GatheredParameters(list(self.module.parameters()), modifier_rank=0):
-                # self.module is the underlying PLUMForCausalLM
+                # self.module is the underlying PIXARForCausalLM
                 return self.module.evaluate(**kwargs)
 
         # Bind it as a method of the engine (self will be the engine):
         model_engine.evaluate = types.MethodType(_engine_evaluate, model_engine)
 
-    print("(train) >> AFTER DEEPSPEED")    
-    
-    if args.vision_tower == "naclip":
-        for mod in vision_tower.modules():
-            if isinstance(mod, torch.nn.LayerNorm):
-                mod.weight.data = mod.weight.data.float()  # keep LayerNorm in float32 for NACLIP
-                if mod.bias is not None:
-                    mod.bias.data = mod.bias.data.float()
-                mod.weight.requires_grad = False
-                if mod.bias is not None:
-                    mod.bias.requires_grad = False
-                
+    print("(train) >> AFTER DEEPSPEED")
+
     for p in vision_tower.parameters():
         p.requires_grad = False
 
@@ -678,7 +576,7 @@ def main(args):
             ckpt_dir = f.readlines()[0].strip()
         if ckpt_dir is None:
             raise ValueError("No checkpoint found")
-        
+
         print(">> (train) Loading checkpoint from: ", ckpt_dir)
         print(">> list dir of ckpt_dir: ", os.listdir(os.path.join(args.resume, ckpt_dir)))
         # load model checkpoint
@@ -688,13 +586,13 @@ def main(args):
         else:
             load_lr_scheduler_states = True
             load_optimizer_states = True
-            
+
         load_path, client_state = model_engine.load_checkpoint(
-                                        args.resume, load_module_strict=False, 
-                                        load_optimizer_states=load_optimizer_states, 
+                                        args.resume, load_module_strict=False,
+                                        load_optimizer_states=load_optimizer_states,
                                         load_lr_scheduler_states=load_lr_scheduler_states
                                     )
-        
+
         scheduler = model_engine.lr_scheduler
         if args.zero_shot_ckpt_path and args.explanatory_seg_data:
             args.start_epoch = latest_epoch
@@ -728,16 +626,43 @@ def main(args):
                 local_rank=args.local_rank,
             ),
         )
-        
+    # * pretrain ckpt validation - before the first epoch
+    if val_dataset is not None and not args.no_eval and args.eval_zero_shot_ckpt:
+        if args.local_rank == 0:
+            print(">> Running pre-training (zero-shot) validation before epoch 0")
+
+        pre_giou, pre_ciou, pre_bio_per_cls_acc = validate(
+            val_loader, model_engine, tokenizer, -1, writer, args
+        )
+        if args.local_rank == 0:
+            # save into metrics file with "-1" to avoid json/int issues
+            try:
+                epoch_metrics["-1"] = {
+                    "giou": float(pre_giou),
+                    "ciou": float(pre_ciou),
+                    "b_acc": float(pre_bio_per_cls_acc[1]),
+                    "i_acc": float(pre_bio_per_cls_acc[2]),
+                    "o_acc": float(pre_bio_per_cls_acc[0]),
+                }
+                with open(metrics_path, "w") as f:
+                    json.dump(epoch_metrics, f, indent=4)
+            except NameError:
+                pass
+
+            wandb.log({
+                "val/giou": pre_giou,
+                "val/ciou": pre_ciou,
+                "val/b_acc": pre_bio_per_cls_acc[1],
+                "val/i_acc": pre_bio_per_cls_acc[2],
+                "val/o_acc": pre_bio_per_cls_acc[0],
+            }, step=0)
+
     if args.eval_only:
-        if args.explanatory_seg_data and args.zero_shot_ckpt_path:
-            print(f"QuestionType.IDENTIFICATION_WITH_LABEL")
-            giou, ciou, macro_gt_mask_metrics, micro_gt_mask_metrics, bio_per_cls_acc = validate_partonomy(val_loader, model_engine, 0, writer, args, parser, tokenizer)
-        else:
-            giou, ciou, bio_per_cls_acc = validate(val_loader, model_engine, 0, writer, args)
+        giou, ciou, bio_per_cls_acc = validate(val_loader, model_engine, tokenizer, 0, writer, args)
         exit()
 
     train_iter = iter(train_loader)
+
     best_score, cur_ciou = 0.0, 0.0
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -749,28 +674,16 @@ def main(args):
             scheduler,
             writer,
             train_iter,
-            args
+            args,
+            tokenizer=tokenizer  # XXX: For debugging
         )
 
         if args.no_eval == False:
-            if args.explanatory_seg_data and args.zero_shot_ckpt_path:
-                giou, ciou, macro_gt_mask_metrics, micro_gt_mask_metrics, bio_per_cls_acc = validate_partonomy(val_loader, model_engine, epoch, writer, args, parser)
-                
-                # XXX: Change this per task eval
-                print(f"> giou: {giou:.4f}, ciou: {ciou:.4f}")
-                print(f"> macro_gt_mask_metrics: {macro_gt_mask_metrics}")
-                print(f"> micro_gt_mask_metrics: {micro_gt_mask_metrics}")
-                
-                exit() # XXX
-                
-            else:
-                giou, ciou, bio_per_cls_acc = validate(val_loader, model_engine, epoch, writer, args)
-                macro_gt_mask_metrics = {'gmIoU-paired': 0.0}
-                micro_gt_mask_metrics = {'gmIoU-paired': 0.0}
+            giou, ciou, bio_per_cls_acc = validate(val_loader, model_engine, tokenizer, epoch, writer, args)
             is_best = giou > best_score
             best_score = max(giou, best_score)
             cur_ciou = ciou if is_best else cur_ciou
-            
+
             if args.local_rank == 0:
                 writer.add_scalar("val/giou", giou, epoch)
                 writer.add_scalar("val/ciou", ciou, epoch)
@@ -778,24 +691,20 @@ def main(args):
                 wandb.log({
                     "val/giou": giou,
                     "val/ciou": ciou,
-                    "val/macro_gIoU": macro_gt_mask_metrics['gmIoU-paired'],
-                    "val/micro_gIoU": micro_gt_mask_metrics['gmIoU-paired'],
                     "val/b_acc": bio_per_cls_acc[1],
                     "val/i_acc": bio_per_cls_acc[2],
                     "val/o_acc": bio_per_cls_acc[0]
                 })
                 epoch_metrics[epoch] = {
-                    'giou': float(giou), 
-                    'ciou': float(ciou), 
-                    'macro_gIoU': float(macro_gt_mask_metrics['gmIoU-paired']),
-                    'micro_gIoU': float(micro_gt_mask_metrics['gmIoU-paired']),
+                    'giou': float(giou),
+                    'ciou': float(ciou),
                     'b_acc': float(bio_per_cls_acc[1]),
                     'i_acc': float(bio_per_cls_acc[2]),
                     'o_acc': float(bio_per_cls_acc[0])
                     }
 
-            with open(metrics_path, "w") as f:
-                json.dump(epoch_metrics, f, indent=4)
+                with open(metrics_path, "w") as f:
+                    json.dump(epoch_metrics, f, indent=4)
 
         if is_best or args.no_eval:
             save_dir = os.path.join(args.log_dir,  f"{run_ckpt_path}_ckpt_model")
@@ -807,14 +716,14 @@ def main(args):
 
 
 def train(
-    
     train_loader,
     model,
     epoch,
     scheduler,
     writer,
     train_iter,
-    args
+    args,
+    tokenizer = None,
 ):
     """Main training loop."""
     batch_time = AverageMeter("Time", ":6.3f")
@@ -846,17 +755,17 @@ def train(
     model.train()
     end = time.time()
     for global_step in range(args.steps_per_epoch):
-        
+
         for i in range(args.grad_accumulation_steps):
             try:
                 input_dict = next(train_iter)
             except:
                 train_iter = iter(train_loader)
                 input_dict = next(train_iter)
-  
+
             data_time.update(time.time() - end)
             input_dict = dict_to_cuda(input_dict)
-            
+
             if args.precision == "fp16":
                 input_dict["images"] = input_dict["images"].half()
                 input_dict["images_clip"] = input_dict["images_clip"].half()
@@ -876,7 +785,7 @@ def train(
             mask_bce_loss = output_dict["mask_bce_loss"]
             mask_dice_loss = output_dict["mask_dice_loss"]
             mask_loss = output_dict["mask_loss"]
-            
+
             loss /= args.grad_accumulation_steps
             ce_loss /= args.grad_accumulation_steps
             seg_cls_loss /= args.grad_accumulation_steps
@@ -893,10 +802,10 @@ def train(
             mask_dice_losses.update(mask_dice_loss.item(), input_dict["images"].size(0))
             mask_losses.update(mask_loss.item(), input_dict["images"].size(0))
             model.backward(loss)
-            
+
             if args.zero_shot_ckpt_path and args.explanatory_seg_data:
                 model.step()
-        
+
         if not (args.zero_shot_ckpt_path and args.explanatory_seg_data):
             model.step()  # during 0-shot training, we take model.step() every args.gradient_accumulation_steps for additional gradient accumulation
 
@@ -941,7 +850,7 @@ def train(
                 writer.add_scalar(
                     "metrics/data_secs_per_batch", data_time.avg, total_step
                 )
-                
+
                 # wandb logging
                 wandb.log({
                     "train/loss": losses.avg,
@@ -975,22 +884,59 @@ def train(
     return train_iter
 
 
+def to_pixar_inputs(args, batch, tokenizer: transformers.AutoTokenizer, set_mc_choices=False):
+    input_dict = {
+        'images': batch['images'],
+        'images_clip': batch['images_clip'],
+        "input_ids": batch['input_ids'],
+        'labels': batch['labels'],
+        'attention_masks': batch['attention_masks'],
+        'offset': batch['offset'],
+        'questions_list': batch['questions_list'],
+        'sampled_classes_list': batch['sampled_classes_list'],
+        'conversation_list': batch['conversation_list'],
+        'masks_list': batch['masks_list'],
+        'label_list': batch['label_list'],
+        'resize_list': batch['resize_list'],
+        'per_token_labels': batch['per_token_labels'],
+        'mask_positions_in_input_ids': batch['mask_positions_in_input_ids'],
+        'inference': batch['inference'],
+        'max_new_tokens': args.model_max_length,
+        'tokenizer': tokenizer,
+    }
+
+    return input_dict
+
+
 @torch.no_grad()
-def validate(val_loader, model_engine, epoch, writer, args):
+def validate(val_loader, model_engine, tokenizer, epoch, writer, args):
     intersection_meter = AverageMeter("Intersec", ":6.3f", Summary.SUM)
     union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
     acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
-    
+
     bio_o_meter = AverageMeter("bio_O_acc", ":6.3f")
     bio_b_meter = AverageMeter("bio_B_acc", ":6.3f")
     bio_i_meter = AverageMeter("bio_I_acc", ":6.3f")
 
+    # micro-, micro-gIoU evaluator initialization
+    iou_evaluator = IoUEvaluator(args.metrics.iou_evaluator_config)
+    micro_config = Namespace(args.metrics.iou_evaluator_config)
+    micro_config.reduction = Reduction.MICRO
+    iou_evaluator_micro = IoUEvaluator(micro_config, metric_group_name='mask_micro')
+    macro_config = Namespace(args.metrics.iou_evaluator_config)
+    macro_config.reduction = Reduction.MACRO
+    iou_evaluator_macro = IoUEvaluator(macro_config, metric_group_name='mask_macro')
+
     model_engine.eval()
 
-    for input_dict in tqdm.tqdm(val_loader):
-        torch.cuda.empty_cache()  # TODO: Remove if not necessary
+    n_batches = args.limit_batches if args.limit_batches is not None else len(val_loader)
+    val_loader = islice(val_loader, n_batches)
 
+    predictions = []
+    for sample_idx, input_dict in enumerate(tqdm.tqdm(val_loader)):
+        input_dict = to_pixar_inputs(args, input_dict, tokenizer)
         input_dict = dict_to_cuda(input_dict)
+
         if args.precision == "fp16":
             input_dict["images"] = input_dict["images"].half()
             input_dict["images_clip"] = input_dict["images_clip"].half()
@@ -1004,8 +950,12 @@ def validate(val_loader, model_engine, epoch, writer, args):
         with torch.no_grad():
             output_dict = model_engine(**input_dict)
 
-        pred_masks = output_dict["pred_masks"]
-        masks_list = output_dict["gt_masks"][0].int() if len(output_dict["gt_masks"]) > 0 else None
+        pred_masks = torch.cat([(pred_mask > 0).int() for pred_mask in output_dict["pred_masks"]]) if len(output_dict["pred_masks"]) > 0 else None
+        masks_list = torch.cat([gt_mask.int() for gt_mask in output_dict["gt_masks"]]) if len(output_dict["gt_masks"]) > 0 else None
+        masks_classes = input_dict['sampled_classes_list'][0] if len(input_dict['sampled_classes_list'][0]) > 0 else None
+
+        assert len(pred_masks) == len(masks_list) == len(masks_classes), f"len(pred_masks) = {len(pred_masks)} | len(masks_list) = {len(masks_list)} | len(masks_classes) = {len(masks_classes)}"
+
         bio_per_cls_counts_dict = output_dict["bio_per_cls_counts_dict"]
         correct_0 = bio_per_cls_counts_dict['correct_0']
         correct_1 = bio_per_cls_counts_dict['correct_1']
@@ -1013,24 +963,19 @@ def validate(val_loader, model_engine, epoch, writer, args):
         total_0 = bio_per_cls_counts_dict['total_0'] if bio_per_cls_counts_dict['total_0'] > 0 else 1  # prevent ZeroDivisionError
         total_1 = bio_per_cls_counts_dict['total_1'] if bio_per_cls_counts_dict['total_1'] > 0 else 1
         total_2 = bio_per_cls_counts_dict['total_2'] if bio_per_cls_counts_dict['total_2'] > 0 else 1
-        if len(pred_masks) > 0:
-            output_list = (pred_masks[0] > 0).int()
-        else:
-            output_list = None
-        
-        assert len(pred_masks) == 1, f"len(pred_masks) = {len(pred_masks)}"
-        
+
         bio_o_meter.update(correct_0 / total_0, total_0)
         bio_b_meter.update(correct_1 / total_1, total_1)
         bio_i_meter.update(correct_2 / total_2, total_2)
-        
-        if masks_list is None or output_list is None:
+
+        if masks_list is None or pred_masks is None:
             continue
 
         intersection, union, acc_iou = 0.0, 0.0, 0.0
-        for mask_i, output_i in zip(masks_list, output_list):
+
+        for mask_i, pred_i in zip(masks_list, pred_masks):
             intersection_i, union_i, _ = intersectionAndUnionGPU(
-                output_i.contiguous().clone(), mask_i.contiguous(), 2, ignore_index=255
+                pred_i.contiguous().clone(), mask_i.contiguous(), 2, ignore_index=255
             )
             intersection += intersection_i
             union += union_i
@@ -1042,14 +987,43 @@ def validate(val_loader, model_engine, epoch, writer, args):
             union
         ), acc_iou_meter.update(acc_iou, n=masks_list.shape[0])
 
-    intersection_meter.all_reduce()
-    union_meter.all_reduce()
-    acc_iou_meter.all_reduce()
-    
-    bio_o_meter.all_reduce()
-    bio_b_meter.all_reduce()
-    bio_i_meter.all_reduce()
-    
+        # Compute micro and macro gIoU
+        # Convert tensors to CPU and then to numpy arrays for the evaluator
+        pred_masks_cpu = pred_masks.cpu().numpy().astype(np.uint8)
+        masks_list_cpu = masks_list.cpu().numpy().astype(np.uint8)
+
+        micro_giou_metrics = iou_evaluator_micro.update(pred_masks_cpu, masks_list_cpu)
+        macro_giou_metrics = iou_evaluator_macro.update(pred_masks_cpu, masks_list_cpu)
+
+        print("=" * 20)
+        print(">>> micro_giou_metrics: ", micro_giou_metrics)
+        print(">>> macro_giou_metrics: ", macro_giou_metrics)
+        print("=" * 20)
+
+        # Create prediction entries for each mask
+        mask_preds ={
+            'sample_idx': sample_idx,
+            'image_path': input_dict.get('image_path', f'sample_{sample_idx}'),
+            'question': input_dict['questions_list'][0] if len(input_dict['questions_list']) > 0 else "",
+            'pred_class': masks_classes if len(masks_classes) > 0 else ['no_label'],
+            'pred_mask': get_mask_rle_dicts(pred_masks_cpu, masks_classes if len(masks_classes) > 0 else ['no_label']),
+            'gt_mask': get_mask_rle_dicts(masks_list_cpu, masks_classes if len(masks_classes) > 0 else ['no_label']),
+            'micro_giou': float(micro_giou_metrics.get(iou_evaluator_micro.metric_group_name, {}).get('gmIoU-paired', 0.0)),
+            'macro_giou': float(macro_giou_metrics.get(iou_evaluator_macro.metric_group_name, {}).get('gmIoU-paired', 0.0)),
+            'giou': float(acc_iou_meter.avg[1]),
+            'ciou': float(intersection_meter.avg[1] / (union_meter.avg[1] + 1e-10)),
+        }
+        predictions.append(mask_preds)
+
+    if dist.is_available() and dist.is_initialized():
+        intersection_meter.all_reduce()
+        union_meter.all_reduce()
+        acc_iou_meter.all_reduce()
+
+        bio_o_meter.all_reduce()
+        bio_b_meter.all_reduce()
+        bio_i_meter.all_reduce()
+
     o_acc = bio_o_meter.avg  # correct_O / total_O
     b_acc = bio_b_meter.avg  # correct_B / total_B
     i_acc = bio_i_meter.avg  # correct_I / total_I
@@ -1066,54 +1040,74 @@ def validate(val_loader, model_engine, epoch, writer, args):
         writer.add_scalar("val/i_acc", i_acc, epoch)
 
         print(f"giou: {giou:.4f}, ciou: {ciou:.4f} | BIO per cls acc: O={o_acc:.4f}, B={b_acc:.4f}, I={i_acc:.4f}")
-        
+
+    # log the predictions
+    if args.output_predictions:
+        # check if args.predictions_path directory exists
+        predictions_dir = os.path.dirname(args.predictions_path)
+        os.makedirs(predictions_dir, exist_ok=True)
+
+        # get the predictions from predictions.json and then append MODEL_TYPE and args.val_dataset to the file name
+        predictions_fname_prefix = args.predictions_path.split('/')[-1].split('.')[0]
+        model_type = args.version.split('/')[-2]
+        ds_sampling_ratio = args.version.split('/')[-1].split('_')[-1]
+        val_dataset_suffix = "_".join(args.val_dataset.split('|'))
+        predictions_path = f"{predictions_fname_prefix}_{model_type}_{ds_sampling_ratio}_{val_dataset_suffix}.json"
+        predictions_path = os.path.join(predictions_dir, predictions_path)
+        predictions_dict = {
+            "giou": float(giou),
+            "ciou": float(ciou),
+            "o_acc": float(o_acc),
+            "b_acc": float(b_acc),
+            "i_acc": float(i_acc),
+            "predictions": predictions,
+        }
+        with open(predictions_path, 'w') as f:
+            json.dump(predictions_dict, f)
+
     return giou, ciou, (o_acc, b_acc, i_acc) # bio_per_cls_acc
 
 
 @torch.no_grad()
-def validate_partonomy(
+def validate_pixar(
             val_loader,
-            model_engine, 
-            epoch, 
-            writer, 
+            model_engine,
+            epoch,
+            writer,
             args,
             parser,
             tokenizer=None
         ):
     """
-    Validate the model on the Partonomy dataset using the validate function from validate_partonomy.py
+    Validate the model on the Pixar dataset using the validate function from validate_pixar.py
     """
-    print(f">> Validating on Partonomy dataset ({args.partonomy_question_type})")
+    print(f">> Validating on Pixar dataset ({args.pixar_data})")
     # Configure your evaluators
     macro_config = Namespace(args.metrics.iou_evaluator_config)
     macro_config.reduction = Reduction.MACRO
     macro_iou_evaluator = IoUEvaluator(macro_config, metric_group_name='mask_macro')
-    
+
     micro_config = Namespace(args.metrics.iou_evaluator_config)
     micro_config.reduction = Reduction.MICRO
     micro_iou_evaluator = IoUEvaluator(micro_config, metric_group_name='mask_micro')
-    
-    part_text_evaluator = PartTextEvaluator(args.metrics.part_text_evaluator_config)
-    mc_part_text_evaluator = MCTextEvaluator(metric_group_name='mc_part_text')
-    mc_object_text_evaluator = MCTextEvaluator(metric_group_name='mc_object_text')
-    
+
     predictions = Predictions()
-    
+
     intersection_meter = AverageMeter("Intersec", ":6.3f", Summary.SUM)
     union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
     acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
-    
+
     bio_o_meter = AverageMeter("bio_O_acc", ":6.3f")
     bio_b_meter = AverageMeter("bio_B_acc", ":6.3f")
     bio_i_meter = AverageMeter("bio_I_acc", ":6.3f")
-    
+
     model_engine.eval()
-    
+
     n_batches = args.limit_batches if args.limit_batches is not None else len(val_loader)
     val_loader = islice(val_loader, n_batches)
-    
-    for batch_idx, input_dict in enumerate(tqdm.tqdm(val_loader, total=n_batches, desc="Validating Partonomy with PLUM")):
-        
+
+    for batch_idx, input_dict in enumerate(tqdm.tqdm(val_loader, total=n_batches, desc="Validating PixarDataset with Pixar")):
+
         input_dict = dict_to_cuda(input_dict)
         if args.precision == "fp16":
             input_dict["images"] = input_dict["images"].half()
@@ -1124,129 +1118,23 @@ def validate_partonomy(
         else:
             input_dict["images"] = input_dict["images"].float()
             input_dict["images_clip"] = input_dict["images_clip"].float()
-        
-        ## DEBUG ## XXX: remove this
-        
-        # questions_list = input_dict.pop("questions_list", None)
-        # conversation_list = input_dict.pop("conversation_list", None)
-        # sampled_classes_list = input_dict.pop("sampled_classes_list", None)
-        # per_token_labels = input_dict.pop("per_token_labels", None)
-        # mask_positions_in_input_ids = input_dict.pop("mask_positions_in_input_ids", None)
-        # breakpoint()
-        
-        ## END DEBUG ##
+
         with torch.no_grad():
             output_dict = model_engine(**input_dict)
-            
-        if args.debug:  # use model_engine.evaluate() and model_engine() to compare outputs
-            evaluate_input_dict = {
-                'images_clip': input_dict['images_clip'],
-                'images': input_dict['images'],
-                'input_ids': input_dict['input_ids'],
-                'resize_list': input_dict['resize_list'],
-                'label_list': input_dict['label_list'],
-                'attention_masks': input_dict['attention_masks'],
-                'gt_bio_span': input_dict['per_token_labels'],
-                'max_new_tokens': args.model_max_length,
-                'tokenizer': tokenizer,
-                'multiple_choice': True,
-                'prompt_user_input': False,
-            }
-            output_dict_eval = model_engine.evaluate(**evaluate_input_dict)
-            output_ids_eval = output_dict_eval.get("output_ids", None)
-            spans_dicts_eval = output_dict_eval.get("spans_dicts", None)
-            pred_masks_eval = output_dict_eval.get("pred_masks", None)  # list[list[torch.Tensor]] - e.g., len(pred_masks) == 5 since there are 5 answer choices and len(pred_masks[0]) == 3 if there are 3 parts
-            ce_losses_eval = output_dict_eval.get("ce_losses", None)
-            pred_masks_eval = torch.cat([(pred_mask > 0).int() for pred_mask in pred_masks_eval[0]], dim=0)
 
-        pred_masks = output_dict["pred_masks"]
-        if len(pred_masks) > 0:
-            output_list = torch.cat([(pred_mask > 0).int() for pred_mask in pred_masks], dim=0)
-        else:
-            output_list = None
-            
-        if len(output_dict["gt_masks"]) > 0:
-            masks_list = torch.cat([gt_mask.int() for gt_mask in output_dict["gt_masks"]], dim=0)
-        else:
-            print(f"No ground truth masks found")
-            continue  # TODO: This is due to mismatch in the gt part name and the part name in the conversation
-            # breakpoint()
-        
-        bio_per_cls_counts_dict = output_dict["bio_per_cls_counts_dict"]
-        correct_0 = bio_per_cls_counts_dict['correct_0']
-        correct_1 = bio_per_cls_counts_dict['correct_1']
-        correct_2 = bio_per_cls_counts_dict['correct_2']
-        total_0 = bio_per_cls_counts_dict['total_0'] if bio_per_cls_counts_dict['total_0'] > 0 else 1  # prevent ZeroDivisionError
-        total_1 = bio_per_cls_counts_dict['total_1'] if bio_per_cls_counts_dict['total_1'] > 0 else 1
-        total_2 = bio_per_cls_counts_dict['total_2'] if bio_per_cls_counts_dict['total_2'] > 0 else 1
-        
-        # NOTE: this assert only applies for model.evaluate() for partonomy dataset
-        # assert len(pred_masks) == 1, f"len(pred_masks) = {len(pred_masks)}"
-        bio_o_meter.update(correct_0 / total_0, total_0)
-        bio_b_meter.update(correct_1 / total_1, total_1)
-        bio_i_meter.update(correct_2 / total_2, total_2)
+        breakpoint()
 
-        if masks_list is None or output_list is None:
-            continue
 
-        intersection, union, acc_iou = 0.0, 0.0, 0.0
-        for mask_i, output_i in zip(masks_list, output_list):
-            intersection_i, union_i, _ = intersectionAndUnionGPU(
-                output_i.contiguous().clone(), mask_i.contiguous(), 2, ignore_index=255
-            )
-            intersection += intersection_i
-            union += union_i
-            acc_iou += intersection_i / (union_i + 1e-5)
-            acc_iou[union_i == 0] += 1.0  # no-object target
-        intersection, union = intersection.cpu().numpy(), union.cpu().numpy()
-        acc_iou = acc_iou.cpu().numpy() / masks_list.shape[0]
-        intersection_meter.update(intersection), union_meter.update(
-            union
-        ), acc_iou_meter.update(acc_iou, n=masks_list.shape[0])
-        
-        macro_giou_metrics = macro_iou_evaluator.update(output_list.cpu().numpy(), masks_list.cpu().numpy())
-        micro_giou_metrics = micro_iou_evaluator.update(output_list.cpu().numpy(), masks_list.cpu().numpy())
-        
-        print(f">>> macro_giou_metrics: {macro_giou_metrics}")
-        print(f">>> micro_giou_metrics: {micro_giou_metrics}")
-        
-        # Evaluator Predictions
-        metrics = {
-            micro_iou_evaluator.metric_group_name: micro_giou_metrics,
-            macro_iou_evaluator.metric_group_name: macro_giou_metrics,
-        }
-        predictions.add_prediction(
-            Prediction(
-                image_path=input_dict["image_paths"][0],
-
-                question_type=QuestionType.IDENTIFICATION_WITH_LABEL,
-                questions=input_dict["questions_list"][0],
-
-                # Parts question outputs
-                # parts_answer_choices=input_dict["part_answer_choices"][0],
-
-                # gt_parts_answer=input_dict["part_answer_choices"][0][gt_parts_answer_index],
-                # predicted_parts_answer=input_dict["part_answer_choices"][0][predicted_parts_answer_index],
-
-                # gt_parts=gt_parts,
-                # predicted_parts=predicted_parts,
-
-                gt_masks=get_mask_rle_dicts(masks_list.cpu().numpy(), ['no_lbl'] * masks_list.shape[0]),
-                predicted_masks=get_mask_rle_dicts(output_list.cpu().numpy(), ['no_lbl'] * output_list.shape[0]),  # gt_predicted_masks or pred_predicted_masks
-
-                metrics=metrics
-            )
-        )
-
+    # TODO: Implement validation loop here for the Pixar Validation dataset
 
     intersection_meter.all_reduce()
     union_meter.all_reduce()
     acc_iou_meter.all_reduce()
-    
+
     bio_o_meter.all_reduce()
     bio_b_meter.all_reduce()
     bio_i_meter.all_reduce()
-    
+
     o_acc = bio_o_meter.avg  # correct_O / total_O
     b_acc = bio_b_meter.avg  # correct_B / total_B
     i_acc = bio_i_meter.avg  # correct_I / total_I
@@ -1271,10 +1159,7 @@ def validate_partonomy(
 
             predictions_dict = predictions.to_dict([
                 micro_iou_evaluator,
-                macro_iou_evaluator,
-                part_text_evaluator,
-                mc_part_text_evaluator,
-                mc_object_text_evaluator
+                macro_iou_evaluator
             ])
 
             with open(args.predictions_path, 'w') as f:
@@ -1290,8 +1175,8 @@ def validate_partonomy(
         writer.add_scalar("val/i_acc", i_acc, epoch)
 
         print(f"giou: {giou:.4f}, ciou: {ciou:.4f} | BIO per cls acc: O={o_acc:.4f}, B={b_acc:.4f}, I={i_acc:.4f}")
-        
-    return giou, ciou, macro_giou_metrics, micro_giou_metrics, (o_acc, b_acc, i_acc) # bio_per_cls_acc
+
+    return giou, ciou, (o_acc, b_acc, i_acc) # bio_per_cls_acc
 
 
 if __name__ == "__main__":

@@ -3,11 +3,11 @@
 # Find a random free port
 FREE_PORT=$(python -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
 
-# 'run_train_plum_ft.sh' uses Partonomy dataset to finetune the models
+# 'run_train_pixar_ft.sh' uses Pixar dataset to finetune the models
 
 # 1) Model size
 if [ -z "$1" ]; then
-    read -p "Enter PLUM model size (13B or 7B): " model_size
+    read -p "Enter Pixar model size (13B or 7B): " model_size
 else
     model_size=$1
 fi
@@ -72,7 +72,7 @@ fi
 
 if [ "$dice_type" == "true" ]; then
     DICE_TYPE="focal_tversky"
-    
+
     # 10) FOCAL_ALPHA
     if [ -z "${10}" ]; then
         read -p "Enter FOCAL_ALPHA (default 0.7): " input_focal_alpha
@@ -103,44 +103,38 @@ else
     TEACHER_REF=""
 fi
 
-# 12) partonomy_dataset_split_name
-if [ -z "${12}" ]; then
-    read -p "Enter partonomy_dataset_split_name (partimagenet|paco_lvis|pascal_part|partonomy): " partonomy_dataset_split_name
-    PARTONOMY_DATASET_SPLIT_NAME=${partonomy_dataset_split_name:-"partimagenet"}
-else
-    PARTONOMY_DATASET_SPLIT_NAME=${12}
-fi
-
 # Convert model_size to lower case
 model_size=$(echo "$model_size" | tr '[:upper:]' '[:lower:]')
 
-LLAVA_MODEL_PATH=liuhaotian/llava-llama-2-13b-chat-lightning-preview
+# LLAVA_MODEL_PATH=liuhaotian/llava-llama-2-13b-chat-lightning-preview
 
 if [ "$model_size" = "13b" ]; then
-    LLAVA_MODEL_PATH="liuhaotian/llava-llama-2-13b-chat-lightning-preview"
+    # LLAVA_MODEL_PATH="liuhaotian/llava-llama-2-13b-chat-lightning-preview"
+    LLAVA_MODEL_PATH=/home/jeonghkim/projects/pixar/hf_cache/llava-llama-2-13b-chat-lightning-preview
 elif [ "$model_size" = "7b" ]; then
-    LLAVA_MODEL_PATH="/shared/nas2/jk100/partonomy_private/weights/liuhaotian/llava-llama-2-7b-chat-lightning-lora-preview"
+    LLAVA_MODEL_PATH=/shared/nas2/jk100/partonomy_private/weights/liuhaotian/llava-llama-2-7b-chat-lightning-lora-preview
 else
     echo "Invalid model size. Please use 13B or 7B."
     exit 1
 fi
 
-VISION_MODEL_PATH=/shared/nas/data/m1/jk100/code/OpenAttrLibrary/LISA/weights/sam_vit_h_4b8939.pth
-DATASET_DIR=/shared/nas/data/m1/jk100/code/OpenAttrLibrary/LISA/dataset
+VISION_MODEL_PATH=/home/jeonghkim/projects/pixar/weights/sam_vit_h_4b8939.pth
+DATASET_DIR=/home/jeonghkim/projects/pixar/data/region_rag_vqa
+VISION_TOWER=/home/jeonghkim/projects/pixar/hf_cache/clip-vit-large-patch14
 
 # TODO: Change ZERO_SHOT_CKPT_PATH to the path of the zero-shot checkpoint after trainin with `run_train_plum_0shot.sh`
 # # [Original]
 # ZERO_SHOT_CKPT_PATH="runs/plum-13b_kld_0.1_focal_tversky_8_v1_0shot/plum-13b_kld_0.1_focal_tversky_8_v1_0shot_bidirbio_2048_accum_10_maxlen512_epochs25_segloss_2_bce_loss_2_kld_loss_0_dice_loss_8_bidir_bio_train_prompt_enc_ckpt_model"
 # # [DICE + Bidirectional Bio]
-ZERO_SHOT_CKPT_PATH="runs/plum-13b_kld_0.1_dice_8_v1_0shot_w_reasonseg/plum-13b_kld_0.1_dice_8_v1_0shot_w_reasonseg_bidirbio_2048_maxlen512_epochs25_bidir_bio_feedback_loop_train_prompt_enc_focal_tversky_04_06_srates_9_5_5_1_ckpt_model"
+# ZERO_SHOT_CKPT_PATH="runs/plum-13b_kld_0.1_dice_8_v1_0shot_w_reasonseg/plum-13b_kld_0.1_dice_8_v1_0shot_w_reasonseg_bidirbio_2048_maxlen512_epochs25_bidir_bio_feedback_loop_train_prompt_enc_focal_tversky_04_06_srates_9_5_5_1_ckpt_model"
+# # [Focal Tversky + Bidirectional Bio]
+ZERO_SHOT_CKPT_PATH="runs/plum-13b_kld_0.1_focal_tversky_8_v1_0shot_w_reasonseg/plum-13b_kld_0.1_focal_tversky_8_v1_0shot_w_reasonseg_bidirbio_2048_maxlen512_epochs25_bidir_bio_feedback_loop_train_prompt_enc_srates_9_5_5_1_ckpt_model"
 # # [Focal Tversky - No Bidirectional Bio]
 # ZERO_SHOT_CKPT_PATH="runs/plum-13b_kld_0.1_focal_tversky_8_v1_0shot_w_reasonseg/plum-13b_kld_0.1_focal_tversky_8_v1_0shot_w_reasonseg_maxlen512_epochs25_kld_loss_0_dice_loss_8_feedback_loop_train_prompt_enc_srates_9_5_5_1_ckpt_model"
 # # [Focal Tversky - No Feedback Loop]
 # ZERO_SHOT_CKPT_PATH="runs/plum-13b_kld_0.1_focal_tversky_8_v1_0shot_w_reasonseg/plum-13b_kld_0.1_focal_tversky_8_v1_0shot_w_reasonseg_bidirbio_2048_maxlen512_epochs25_bidir_bio_train_prompt_enc_srates_9_5_5_1_ckpt_model"
 
-# EXP_NAME="plum-${model_size}_kld_${kld_loss_weight}_${DICE_TYPE}_${dice_loss_weight}_v1_partonomy_ft_focal_tversky_04_06"
-# EXP_NAME="plum-${model_size}_kld_${kld_loss_weight}_${DICE_TYPE}_${dice_loss_weight}_v1_partonomy_ft"
-EXP_NAME="plum-${model_size}_kld_${kld_loss_weight}_${DICE_TYPE}_${dice_loss_weight}_rebuttal_partonomy_ft_bidirbio"
+EXP_NAME="pixar-${model_size}_kld_${kld_loss_weight}_${DICE_TYPE}_${dice_loss_weight}_pixar_ft"
 # EVAL_CKPT_PATH="runs/plum-13b_kld_0.1_focal_tversky_8_v1_0shot/plum-13b_kld_0.1_focal_tversky_8_v1_0shot_bidirbio_2048_accum_10_maxlen512_epochs25_segloss_2_bce_loss_2_kld_loss_0_dice_loss_8_bidir_bio_train_prompt_enc_ckpt_model"
 
 echo "Running experiment: $EXP_NAME"
@@ -153,17 +147,16 @@ echo " - FOCAL_BETA=${FOCAL_BETA}"
 echo " - Using GPUs: ${gpu_ids}"
 echo " - Using port: ${FREE_PORT}"
 
-deepspeed --include localhost:${gpu_ids} --master_port=${FREE_PORT} plum_train_ds_dist.py \
+deepspeed --include localhost:${gpu_ids} --master_port=${FREE_PORT} pixar_train_ds.py \
     --version=$LLAVA_MODEL_PATH \
     --dataset_dir=$DATASET_DIR \
     --vision_pretrained=$VISION_MODEL_PATH \
+    --vision-tower=$VISION_TOWER \
     --zero_shot_ckpt_path=$ZERO_SHOT_CKPT_PATH \
-    --dataset="explanatory_seg" \
-    --explanatory_seg_data \
-    --partonomy_dataset_split=$PARTONOMY_DATASET_SPLIT_NAME \
-    --sample_one_question_per_image \
+    --dataset="pixar" \
+    --pixar_data="oven||infoseek||aokvqa||okvqa||textvqa||webqa" \
     --random_seed=42 \
-    --sample_rates="1" \
+    --sample_rates="2,1,1,2,1,1" \
     --batch_size=$BATCH_SIZE \
     --grad_accumulation_steps 10 \
     --ce_loss_weight=1.0 \
@@ -177,18 +170,18 @@ deepspeed --include localhost:${gpu_ids} --master_port=${FREE_PORT} plum_train_d
     --precision=$precision \
     --model_max_length 512 \
     --dice_scale_factor 1000.0 \
-    --epochs 1 \
+    --epochs 3 \
     --train_mask_prompt_encoder \
     --focal_tversky_alpha=$FOCAL_ALPHA \
     --focal_tversky_beta=$FOCAL_BETA \
     --use_bidir_bio \
     --bidir_dim_feedforward 2048 \
     --lr 3e-4 \
+    --use_feedback_loop \
     --auto_resume
 
-    #     --use_bidir_bio \ <- TODO REVIVE!!!
 
-
+    # --dataset="pixar" \
     # --use_feedback_loop \
     # --eval_ckpt_path=$EVAL_CKPT_PATH \
     # --limit_batches 200 \

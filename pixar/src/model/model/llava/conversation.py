@@ -377,6 +377,22 @@ conv_llava_v1_mmtag = Conversation(
     version="v1_mmtag",
 )
 
+conv_pixar_0shot_v1 = Conversation(
+    system="A chat between a curious human and an artificial intelligence assistant. "
+    "The assistant gives helpful, detailed, and polite answers to the human's questions. "
+    "Generate <search> token to trigger search API calls and generate a search query right between the <search> </search> tokens.  "
+    "If the user question is better answered with image or region-specific crops, generateion <search> <image> </search>, or <search> <region> </search> accordingly. "
+    "The retrieved content through search API call will be enclosed between <information> </information>. "
+    "Use the retrieved knowledge to answer the user question.",
+    roles=("USER", "ASSISTANT"),
+    version="v1",
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.TWO,
+    sep=" ",
+    sep2="</s>",
+)
+
 default_conversation = conv_vicuna_v0
 conv_templates = {
     "default": conv_vicuna_v0,
@@ -390,6 +406,7 @@ conv_templates = {
     "v0_mmtag": conv_llava_v0_mmtag,
     "llava_v1": conv_llava_v1,
     "v1_mmtag": conv_llava_v1_mmtag,
+    "pixar_0shot_v1": conv_pixar_0shot_v1,
     "llava_llama_2": conv_llava_llama_2,
     "mpt": conv_mpt,
 }

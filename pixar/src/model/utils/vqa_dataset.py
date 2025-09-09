@@ -55,7 +55,7 @@ class VQADataset(torch.utils.data.Dataset):
         image_size: int = 224,
         num_classes_per_sample: int = 3,
         exclude_val=False,
-        vqa_data="llava_v1_5_mix665k",
+        vqa_data="llava_v1_5_mix665k"
     ):
         self.exclude_val = exclude_val
         self.samples_per_epoch = samples_per_epoch
@@ -69,7 +69,7 @@ class VQADataset(torch.utils.data.Dataset):
         self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
 
         DATA_DIR = os.path.join(base_image_dir, "llava_dataset")
-        self.vqa_image_root = os.path.join(base_image_dir, "coco/train2017")
+        self.vqa_image_root = os.path.join(base_image_dir, "coco/train2017")  # for 'llava_instruct_150k.json'
         with open(os.path.join(DATA_DIR, "{}.json".format(vqa_data))) as f:
             vqa_data = json.load(f)
         self.vqa_data = vqa_data
@@ -94,8 +94,15 @@ class VQADataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         idx = random.randint(0, len(self.vqa_data) - 1)
         item = self.vqa_data[idx]
-        image_path = os.path.join(self.vqa_image_root, os.path.basename(item["image"]))
-        image = cv2.imread(image_path)
+        image_path = item.get("image", "")
+        _text_only = False  # _text_only == True, when item['image'] is not there
+        if image_path:
+            image_path = os.path.join(self.vqa_image_root, os.path.basename(item["image"]))
+            image = cv2.imread(image_path)
+        else:
+            _text_only = True
+            image = None
+
         if image is None:
             # handle the error, e.g., skip this sample or load a default image
             image = np.zeros((1024, 1024, 3), dtype=np.uint8)
@@ -136,9 +143,9 @@ class VQADataset(torch.utils.data.Dataset):
 
         masks = torch.rand(0, *ori_size)
         label = torch.ones(ori_size) * self.ignore_label
-        
-        per_token_label_dict = [{}]  # VQADataset does not have masks - ignore during training
 
+        per_token_label_dict = [{}]  # VQADataset does not have masks - ignore during training
+        search_calls_norm = []  # VQADataset doees not have search_calls_norm
         return (
             image_path,
             image,
@@ -150,6 +157,7 @@ class VQADataset(torch.utils.data.Dataset):
             questions,
             sampled_classes,
             per_token_label_dict,
+            search_calls_norm
         )
 
 
@@ -218,7 +226,7 @@ class TextVQADataset(torch.utils.data.Dataset):
             image = np.zeros((1024, 1024, 3), dtype=np.uint8) # handle the error, e.g., skip this sample or load a default image
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         ori_size = image.shape[:2]
-        
+
         # Process image for CLIP
         image_clip = self.clip_image_processor.preprocess(image, return_tensors="pt")[
             "pixel_values"
@@ -240,13 +248,13 @@ class TextVQADataset(torch.utils.data.Dataset):
             mm_use_im_start_end=mm_use_im_start_end,
             is_textvqa=True
         )
-        
+
         roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
         conversations = []
 
         conv.messages = []
         role = conv.roles[0]
-        
+
         text_instructions = 'Answer the question using a single word or phrase.'
         conv.append_message(role, source + ' ' + text_instructions)  # https://github.com/haotian-liu/LLaVA/issues/515
         conversations.append(conv.get_prompt())
@@ -260,7 +268,8 @@ class TextVQADataset(torch.utils.data.Dataset):
         masks = torch.rand(0, *ori_size)
         label = torch.ones(ori_size) * self.ignore_label
         per_token_label_dict = [{}]
-        
+        search_calls_norm = []
+
         inference = True
 
         return (
@@ -274,6 +283,7 @@ class TextVQADataset(torch.utils.data.Dataset):
             questions,
             sampled_answer_choices,
             per_token_label_dict,
+            search_calls_norm,
             inference,
             'textvqa'
         )
@@ -284,7 +294,7 @@ class GQADataset(torch.utils.data.Dataset):
     pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
     img_size = 1024
     ignore_label = 255
-    
+
     def __init__(self, base_image_dir, tokenizer, vision_tower, split="val", use_mm_start_end=False):
         self.base_image_dir = base_image_dir
         self.tokenizer = tokenizer
@@ -294,15 +304,15 @@ class GQADataset(torch.utils.data.Dataset):
         DATA_DIR = os.path.join(base_image_dir, "gqa")
         with open(os.path.join(DATA_DIR, "questions", f"{split}_balanced_questions.json")) as f:
             self.gqa_data = json.load(f)
-            
-        self.limit_num_samples = 5000 
-        self.gqa_data_key_indices = {idx: instance_id for idx, (instance_id, instance_dict) in enumerate(self.gqa_data.items()) if idx < self.limit_num_samples}    
+
+        self.limit_num_samples = 5000
+        self.gqa_data_key_indices = {idx: instance_id for idx, (instance_id, instance_dict) in enumerate(self.gqa_data.items()) if idx < self.limit_num_samples}
 
         print(f"GQA_{split}_data: ", len(self.gqa_data_key_indices))
 
     def __len__(self):
         return len(self.gqa_data_key_indices)
-    
+
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize pixel values and pad to a square input."""
         # Normalize colors
@@ -314,7 +324,7 @@ class GQADataset(torch.utils.data.Dataset):
         padw = self.img_size - w
         x = F.pad(x, (0, padw, 0, padh))
         return x
-    
+
     def __getitem__(self, idx):
         item = self.gqa_data[self.gqa_data_key_indices[idx]]
         image_path = os.path.join(self.base_image_dir, "gqa/images", f"{item['imageId']}.jpg")
@@ -323,7 +333,7 @@ class GQADataset(torch.utils.data.Dataset):
             image = np.zeros((1024, 1024, 3), dtype=np.uint8)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         ori_size = image.shape[:2]
-        
+
         # Process image for CLIP
         clip_image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower)
         image_clip = clip_image_processor.preprocess(image, return_tensors="pt")[
@@ -347,13 +357,13 @@ class GQADataset(torch.utils.data.Dataset):
             mm_use_im_start_end=mm_use_im_start_end,
             is_textvqa=True
         )
-        
+
         roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
         conversations = []
 
         conv.messages = []
         role = conv.roles[0]
-        
+
         text_instructions = 'Answer the question using a single word or phrase.'
         conv.append_message(role, source + ' ' + text_instructions)
         conversations.append(conv.get_prompt())
@@ -367,7 +377,7 @@ class GQADataset(torch.utils.data.Dataset):
         masks = torch.rand(0, *ori_size)
         label = torch.ones(ori_size) * self.ignore_label
         per_token_label_dict = [{}]
-        
+        search_calls_norm = []
         inference = True
 
         return (
@@ -381,10 +391,11 @@ class GQADataset(torch.utils.data.Dataset):
             questions,
             sampled_answer_choices,
             per_token_label_dict,
+            search_calls_norm,
             inference,
             'gqa'
         )
-    
+
 
 class POPEDataset(torch.utils.data.Dataset):
     pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
@@ -402,11 +413,11 @@ class POPEDataset(torch.utils.data.Dataset):
         # Setup paths
         DATA_DIR = os.path.join(base_image_dir, "pope/coco")
         self.image_root = os.path.join(DATA_DIR, "val2014")  # POPE uses COCO val2014 images
-        
+
         # Load POPE questions
         pope_types = ["random", "popular", "adversarial"]
         self.pope_data = []
-        
+
         for pope_type in pope_types:
             data = []
             with open(os.path.join(DATA_DIR, f"coco_pope_{pope_type}.json")) as f:
@@ -443,7 +454,7 @@ class POPEDataset(torch.utils.data.Dataset):
             image = np.zeros((1024, 1024, 3), dtype=np.uint8)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         ori_size = image.shape[:2]
-        
+
         # Process image for CLIP
         clip_image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower)
         image_clip = clip_image_processor.preprocess(image, return_tensors="pt")[
@@ -467,13 +478,13 @@ class POPEDataset(torch.utils.data.Dataset):
             mm_use_im_start_end=mm_use_im_start_end,
             is_textvqa=True
         )
-        
+
         roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
         conversations = []
 
         conv.messages = []
         role = conv.roles[0]
-        
+
         text_instructions = 'Please answer the question with "Yes" or "No".'
         conv.append_message(role, source + ' ' + text_instructions)
         conversations.append(conv.get_prompt())
@@ -487,7 +498,7 @@ class POPEDataset(torch.utils.data.Dataset):
         masks = torch.rand(0, *ori_size)
         label = torch.ones(ori_size) * self.ignore_label
         per_token_label_dict = [{}]
-        
+
         inference = True
 
         return (
@@ -504,7 +515,7 @@ class POPEDataset(torch.utils.data.Dataset):
             inference,
             'pope',
         )
-        
+
 
 class CragMMDataset(torch.utils.data.Dataset):
     pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
@@ -537,7 +548,7 @@ class CragMMDataset(torch.utils.data.Dataset):
         self.split = "validation"
         self.dataset = self.crag_mm_data[self.split]
         self.use_mm_start_end = use_mm_start_end
-        
+
     def __len__(self):
         return len(self.dataset)
 
@@ -555,7 +566,7 @@ class CragMMDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         item = self.dataset[idx]
-        
+
         # Handle PIL Image directly since item['image'] is a PIL Image object
         if isinstance(item['image'], Image.Image):
             image = cv2.cvtColor(np.array(item['image']), cv2.COLOR_RGB2BGR)
@@ -576,24 +587,24 @@ class CragMMDataset(torch.utils.data.Dataset):
                     except Exception as e:
                         print(f"Error downloading image from {image_url}: {e}")
                         image = np.zeros((1024, 1024, 3), dtype=np.uint8)
-        
+
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         ori_size = image.shape[:2]
         image_clip = self.clip_image_processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
-        
+
         image = self.transform.apply_image(image)  # preprocess image for sam
         resize = image.shape[:2]
-        
+
         conv = conversation_lib.default_conversation.copy()
         num_turns = len(item['turns']['query'])
         is_single_turn = num_turns == 1
         print(f"Type: {'Single-turn' if is_single_turn else 'Multi-turn'} ({num_turns} turns)")
-        
+
         if is_single_turn:
             source = item["turns"]["query"][0]
         else:
             raise NotImplementedError("Multi-turn is not supported yet")
-        
+
         source = preprocess_multimodal(
             source,
             mm_use_im_start_end=conv.sep_style == conversation_lib.SeparatorStyle.TWO,
@@ -605,13 +616,13 @@ class CragMMDataset(torch.utils.data.Dataset):
         role = conv.roles[0]
         conv.append_message(role, source)
         conversations.append(conv.get_prompt())
-        
+
         questions = conversations
-        
+
         answer_lookup = {}
         if 'answers' in item and item['answers'] is not None:
             answer_lookup = {
-                interaction_id: ans_full 
+                interaction_id: ans_full
                 for interaction_id, ans_full in zip(
                     item['answers']['interaction_id'],
                     item['answers']['ans_full']
@@ -627,14 +638,14 @@ class CragMMDataset(torch.utils.data.Dataset):
                 sampled_answer_choices.append("")  # Default empty answer if not found
         else:
             raise NotImplementedError("Multi-turn is not supported yet")
-        
+
         image = self.preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
-        
+
         # TODO: CragMM dataset doesn't use masks during evaluation
         masks = torch.rand(0, *ori_size)
         label = torch.ones(ori_size) * self.ignore_label
         per_token_label_dict = [{}]
-        
+        search_calls_norm = []
         inference = True
 
         return (
@@ -648,6 +659,7 @@ class CragMMDataset(torch.utils.data.Dataset):
             questions,
             sampled_answer_choices,
             per_token_label_dict,
+            search_calls_norm,
             inference,
             'cragmm'
         )

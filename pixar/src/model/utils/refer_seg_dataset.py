@@ -184,7 +184,7 @@ class ReferSegDataset(torch.utils.data.Dataset):
             conv.append_message(conv.roles[1], answers[i])
             conversations.append(conv.get_prompt())
             i += 1
-            
+
         image = self.preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
 
         flag = False
@@ -269,11 +269,13 @@ class ReferSegDataset(torch.utils.data.Dataset):
         masks = torch.from_numpy(masks)
         label = torch.ones(masks.shape[1], masks.shape[2]) * self.ignore_label
         temp_dict = defaultdict(list)
-        
+
         per_token_label_dict = [{k: v} for k, v in zip(sampled_classes, masks)]
         if len(conversations) > len(per_token_label_dict):
             per_token_label_dict.extend([{} for _ in range(len(conversations) - len(per_token_label_dict))])
-        
+
+        search_calls_norm = []
+
         return (
             image_path,
             image,
@@ -285,5 +287,5 @@ class ReferSegDataset(torch.utils.data.Dataset):
             questions,
             sampled_classes,
             per_token_label_dict,
-            []
+            search_calls_norm
         )

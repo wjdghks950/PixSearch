@@ -5,14 +5,13 @@ import torch.nn.functional as F
 
 from typing import List
 from transformers import BitsAndBytesConfig, CLIPVisionModel
-from torchcrf import CRF
 
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, IGNORE_INDEX, IMAGE_TOKEN_INDEX,
                          DEFAULT_IMAGE_PATCH_TOKEN, BIO_START_LBL, BIO_INTERM_LBL, BIO_NO_LBL, _with_patch_offset)
 
 from .mask_feedback import TemporalMaskPooler, FilmModulator
 
-from .llava.model.language_model.llava_llama_pixar import (LlavaLlamaForCausalLM,
+from .llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM,
                                                      LlavaLlamaModel)
 from .segment_anything import build_sam_vit_h
 
@@ -68,7 +67,7 @@ def focal_tversky_loss(
     Args:
         inputs: A float tensor of shape [B, H, W] or [B, 1, H, W].
                 These are raw logits from the model (will be passed through sigmoid).
-        targets: A float tensor of the same shape as inputs (excluding channel if present). 
+        targets: A float tensor of the same shape as inputs (excluding channel if present).
                  0/1 binary ground truth mask.
         num_masks: Normalizing factor used just like in dice_loss, typically 1 per mask.
         alpha: Weighting factor for FN in the Tversky index.
@@ -80,30 +79,30 @@ def focal_tversky_loss(
         A scalar tensor representing the Focal Tversky Loss, averaged over 'num_masks'.
     '''
     probs = torch.sigmoid(inputs)  # shape: [B, H, W] or [B, 1, H, W]
-    
+
     if probs.dim() == 4 and probs.size(1) == 1:  # if shape is [B, 1, H, W], remove channel dim
         probs = probs.squeeze(1)
     if targets.dim() == 4 and targets.size(1) == 1:
         targets = targets.squeeze(1)
-    
+
     # flatten: [B, H, W] -> [B, H*W]
     probs_flat = probs.flatten(1)
     targets_flat = targets.flatten(1)
-    
+
     #    TP = sum(p*g), FP = sum(p*(1-g)), FN = sum((1-p)*g)
     TP = (probs_flat * targets_flat).sum(dim=1)
     FP = (probs_flat * (1 - targets_flat)).sum(dim=1)
     FN = ((1 - probs_flat) * targets_flat).sum(dim=1)
-    
+
     # 4) Compute the Tversky index for each sample in the batch
     tversky_index = (TP + eps) / (TP + alpha*FN + beta*FP + eps)  # shape: [B]
-    
+
     # 5) Compute Focal Tversky Loss: (1 - TverskyIndex)^gamma
     focal_tversky = (1.0 - tversky_index) ** gamma  # shape: [B]
-    
+
     # 6) Average over the batch, then divide by num_masks (like your dice_loss)
     loss = focal_tversky.sum() / (num_masks + 1e-8)
-    
+
     return loss
 
 
@@ -132,7 +131,7 @@ def kl_divergence_loss(t_ref, t_proj, sigma=1.0):
     Args:
         t_ref: nn.Embedding parameters at t=0 (frozen parameters) used as reference distribution
         t_proj: nn.Embedding parameters that are being updated via gradients from SAM decoder
-        
+
         This KL divergence loss is for two Gaussians with the same covariance.
     '''
     return 0.5 / (sigma ** 2) * F.mse_loss(t_proj, t_ref, reduction='mean')
@@ -152,31 +151,31 @@ def hinge_loss(log_likelihoods, margin=1.0):
 
 
 def compute_bio_per_class_counts(
-        pred_per_token_labels: torch.Tensor, 
+        pred_per_token_labels: torch.Tensor,
         gt_per_token_labels: torch.Tensor,
         num_classes: int = 3,
     ):
     '''
     Returns the number of correct predictions and the total number of tokens
     for each of the 3 BIO classes.
-    
+
     Args:
         pred_per_token_labels: [N]  (0: O, 1: B, 2: I)
         gt_per_token_labels:   [N]
         num_classes: [2, 3] - 2 if self.pred_binary_span == True
-    
+
     Returns:
         correct_0, total_0,
         correct_1, total_1,
         correct_2, total_2
     '''
     correct_mask = (pred_per_token_labels == gt_per_token_labels)
-    
+
     # class 0: 'O'
     mask_0 = (gt_per_token_labels == 0)
     correct_0 = (correct_mask & mask_0).sum().item()
     total_0 = mask_0.sum().item()
-    
+
     # class 1: 'B'
     mask_1 = (gt_per_token_labels == 1)
     correct_1 = (correct_mask & mask_1).sum().item()
@@ -191,7 +190,7 @@ def compute_bio_per_class_counts(
         mask_2 = -1
         correct_2 = -1
         total_2 = -1
-    
+
     return {
         'correct_0': correct_0, 'total_0': total_0,
         'correct_1': correct_1, 'total_1': total_1,
@@ -202,7 +201,7 @@ def compute_bio_per_class_counts(
 def check_nan_hook(module, input, output):
     if torch.isnan(output).any():
         print(f">> NaN in {module}")
-    
+
 
 class BidirectionalEncoderBlock(nn.Module):
     '''
@@ -268,7 +267,7 @@ class BioVisualFusionBlock(nn.Module):
         )
         self.norm_ffn = nn.LayerNorm(d_model)
         # self.apply(self._init_weights)
-        
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             nn.init.xavier_uniform_(module.weight)
@@ -283,7 +282,7 @@ class BioVisualFusionBlock(nn.Module):
                     nn.init.xavier_uniform_(param)
                 elif 'bias' in name:
                     nn.init.zeros_(param)
-                    
+
     def initialize_weights(self):
         self.apply(self._init_weights)
 
@@ -295,16 +294,16 @@ class BioVisualFusionBlock(nn.Module):
         ffn_output = self.ffn(query)
         query = self.norm_ffn(query + ffn_output)
         return query
-    
 
 
-class PlumMetaModel:
+
+class PixarMetaModel:
     def __init__(
         self,
         config,
         **kwargs,
     ):
-        super(PlumMetaModel, self).__init__(config)
+        super(PixarMetaModel, self).__init__(config)
 
         self.config = config
         self.vision_pretrained = kwargs.get("vision_pretrained", None)
@@ -313,10 +312,10 @@ class PlumMetaModel:
             self.config.out_dim = kwargs["out_dim"]
         if not hasattr(self.config, "train_mask_prompt_encoder"):  # args for fine-tuning SAM prompt encoder
             self.config.train_mask_prompt_encoder = kwargs["train_mask_prompt_encoder"]
-        
-        self.initialize_plum_modules(self.config, **kwargs)
 
-    def initialize_plum_modules(self, config, **kwargs):
+        self.initialize_pixar_modules(self.config, **kwargs)
+
+    def initialize_pixar_modules(self, config, **kwargs):
         '''
         Initialize the text_hidden_fcs and tok2mask_fc layers for token embeddings to SAM query transformation
         '''
@@ -347,7 +346,7 @@ class PlumMetaModel:
         self.text_hidden_fcs.train()
         for param in self.text_hidden_fcs.parameters():
             param.requires_grad = True
-            
+
         # initialize the per-token classifier to determine which hidden_state should be fed into SAM
         self.pred_binary_span = kwargs.pop("pred_binary_span", False)
         cls_out_dim = 1 if self.pred_binary_span else 3  # using BIO tagging scheme to handle the sub-token aggregation
@@ -362,13 +361,13 @@ class PlumMetaModel:
             param.requires_grad = True
 
 
-class PlumModel(PlumMetaModel, LlavaLlamaModel):
+class PixarModel(PixarMetaModel, LlavaLlamaModel):
     def __init__(
         self,
         config,
         **kwargs,
     ):
-        super(PlumModel, self).__init__(config, **kwargs)
+        super(PixarModel, self).__init__(config, **kwargs)
 
         self.config.use_cache = False
         self.config.vision_tower = self.config.mm_vision_tower
@@ -381,7 +380,7 @@ class PlumModel(PlumMetaModel, LlavaLlamaModel):
         self.config.mm_use_im_patch_token = False
 
 
-class PLUMForCausalLM(LlavaLlamaForCausalLM):
+class PIXARForCausalLM(LlavaLlamaForCausalLM):
     def __init__(
         self,
         config,
@@ -419,24 +418,23 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
             self.seg_cls_loss_per_cls_weight = None
             self.use_hinge_loss = False
             self.use_feedback_loop = False
-        
+
         super().__init__(config)
 
-        self.model = PlumModel(config, **kwargs)
+        self.model = PixarModel(config, **kwargs)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.mask_pooler = None
-        
+
         # initialize weights and apply final processing
         self.post_init()
-        
+
         self.use_teacher_ref = kwargs.pop("use_teacher_ref", False)
         self.teacher_llm = None  # postpone teacher_llm initialization until after pretrained weights are loaded.
         self.register_buffer('seg_h_ref', None)  # t=0 copy placeholder for seg_h_ref
         self.ema_update_seg_h_ref = False
-        
+
         # use bidirectional encoder for BIO tagging or not
         self.use_bidir_bio = kwargs.pop("use_bidir_bio", False)
-        self.use_crf_bio = kwargs.pop("use_crf_bio", False)
         self.pred_binary_span = kwargs.pop("pred_binary_span", False)
         self.num_token_classes = 2 if self.pred_binary_span else 3
         if self.use_bidir_bio:
@@ -446,15 +444,13 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
                 dim_feedforward=kwargs.pop("bidir_dim_feedforward", 2048),
                 dropout=0.1
             )
-            if self.use_crf_bio:
-                self.crf = CRF(num_tags=3, batch_first=True)  # 3 -> 0: O, 1: B, 2: I
         else:
             self.bio_encoder = None
-            
+
         if self.use_feedback_loop:
             self.initialize_mask_pooler()
 
-        # Cross attention block for BIO spans to attend to the image patch embeddings
+        # cross attention block for BIO spans to attend to the image patch embeddings
         self.use_cross_attn_bio = kwargs.pop("use_cross_attn_bio", False)
         if self.use_cross_attn_bio:
             self.bio_cross_attn = BioVisualFusionBlock(
@@ -465,17 +461,79 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
         else:
             self.bio_cross_attn = None
 
+    # def _touch_trainable_modules(self):
+    #     '''
+    #     ensure all trainable submodules participate in the graph every step
+    #     '''
+    #     zero = torch.zeros((), device=next(self.parameters()).device, dtype=torch.float32)
+    #     # mirror your params_to_train list in pixar_train_ds.py
+    #     modules = [
+    #         self.lm_head,
+    #         self.model.text_hidden_fcs,
+    #         self.model.token_to_mask_fcs,
+    #         getattr(self.model.visual_model, "mask_decoder", None),
+    #     ]
+    #     if self.model.config.train_mask_prompt_encoder:
+    #         modules.append(self.model.visual_model.prompt_encoder)
+    #     if getattr(self, "bio_encoder", None) is not None:
+    #         modules.append(self.bio_encoder)
+    #     if getattr(self, "mask_pooler", None) is not None:
+    #         modules.append(self.mask_pooler)
+
+    #     for m in modules:
+    #         if m is None:
+    #             continue
+    #         for p in m.parameters():
+    #             if p.requires_grad:
+    #                 zero = zero + p.float().sum() * 0.0
+    #                 break
+    #     return zero
+
+    def _touch_trainable_modules(self) -> torch.Tensor:
+        '''
+        Ensure every trainable parameter in the relevant submodules participates
+        in the graph each step. This prevents per-rank bucket divergence.
+        '''
+        device = next(self.parameters()).device
+        z = torch.zeros((), device=device, dtype=torch.float32)
+
+        def touch_all_params(mod):
+            nonlocal z
+            if mod is None:
+                return
+            # accumulate a zero-weight scalar that depends on every trainable param
+            for p in mod.parameters():
+                if p.requires_grad:
+                    z = z + p.float().sum() * 0.0  # 0 grad
+
+        touch_all_params(self.lm_head)
+        touch_all_params(self.model.text_hidden_fcs)
+        touch_all_params(self.model.token_to_mask_fcs)
+        touch_all_params(getattr(self.model.visual_model, "mask_decoder", None))
+
+        if getattr(self.model.config, "train_mask_prompt_encoder", False):
+            touch_all_params(self.model.visual_model.prompt_encoder)
+        if getattr(self, "bio_encoder", None) is not None:
+            touch_all_params(self.bio_encoder)
+        if getattr(self, "mask_pooler", None) is not None:
+            touch_all_params(self.mask_pooler)
+        if getattr(self, "bio_cross_attn", None) is not None:
+            touch_all_params(self.bio_cross_attn)
+
+        return z
+
+
 
     def initialize_teacher_llm(self):
-        print(">> (PLUM.py) Initializing teacher LLM...")
+        print(">> (PIXAR.py) Initializing teacher LLM...")
         # Deep copy the underlying LlavaLlamaModel from the fully loaded model
         self.teacher_llm = copy.deepcopy(self.get_model()).float()
         for param in self.teacher_llm.parameters():
             param.requires_grad = False
         self.teacher_llm.eval()
-        print(">> (PLUM.py) Teacher LLM initialized.")
+        print(">> (PIXAR.py) Teacher LLM initialized.")
 
-        
+
     def initialize_mask_pooler(self):
         prompt_encoder = self.model.visual_model.prompt_encoder
         decoder_embed_dim = self.model.visual_model.prompt_encoder.embed_dim
@@ -488,7 +546,7 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
             prompt_encoder=prompt_encoder,
             mask_modulator=mask_modulator
         )
-        
+
 
     def get_visual_embs(self, pixel_values: torch.FloatTensor):
         with torch.no_grad():
@@ -521,17 +579,24 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
         mask_positions_in_input_ids: list,  # list of lists of starting token indices per sample
         inference: bool = False,
         **kwargs,
-    ):        
-        image_embeddings = self.get_visual_embs(images)
-        batch_size = image_embeddings.shape[0]
+    ):
+        # detect if it's text-only or has image tokens
+        im_start_id = 32000  # tokenizer.convert_tokens_to_ids(DEFAULT_IM_START_TOKEN)
+        im_end_id = 32001  # tokenizer.convert_tokens_to_ids(DEFAULT_IM_END_TOKEN)
+        has_image_tokens = (input_ids == im_start_id).any()
+        if has_image_tokens:
+            image_embeddings = self.get_visual_embs(images)
+        else:
+            image_embeddings = None
+        batch_size = (len(offset) - 1)
         assert batch_size == len(offset) - 1
-        
+
         if inference:
             n_batch = 1
             length = input_ids.shape[0]
             assert images_clip.shape[0] == 1
             images_clip_extend = images_clip.expand(length, -1, -1, -1).contiguous()
-            
+
             output_hidden_states = []
             ce_losses = []
             for i in range(n_batch):
@@ -565,7 +630,7 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
                 )
                 images_clip_list.append(images_clip_i)
             images_clip = torch.cat(images_clip_list, dim=0)
-            
+
             output_per_instance_loss = False
             if self.use_hinge_loss:
                 output_per_instance_loss = True
@@ -582,36 +647,37 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
             logits = outputs.logits
             ce_loss = outputs.loss  # the lm loss
 
-        IMAGE_TOKENS_OFFSET = 255
-        im_start_id = 32000  # XXX: tokenizer.convert_tokens_to_ids(DEFAULT_IM_START_TOKEN)
-        im_end_id   = 32001  # XXX: tokenizer.convert_tokens_to_ids(DEFAULT_IM_END_TOKEN)
-        im_start_positions = (input_ids == im_start_id).nonzero(as_tuple=True)
-        im_end_positions = (input_ids == im_end_id).nonzero(as_tuple=True)
-        im_start_pos_list = list(zip(im_start_positions[0].tolist(), im_start_positions[1].tolist()))
-        im_end_pos_list = list(zip(im_end_positions[0].tolist(), im_end_positions[1].tolist()))
-        
+        IMAGE_TOKENS_OFFSET = 255 if has_image_tokens else 0
+        im_start_id = 32000  # XXX tokenizer.convert_tokens_to_ids(DEFAULT_IM_START_TOKEN)
+        im_end_id = 32001  # XXX tokenizer.convert_tokens_to_ids(DEFAULT_IM_END_TOKEN)
+        im_start_positions = (input_ids == im_start_id).nonzero(as_tuple=True) if has_image_tokens else (torch.tensor([], device=input_ids.device, dtype=torch.long), torch.tensor([], device=input_ids.device, dtype=torch.long))
+        im_end_positions = (input_ids == im_end_id).nonzero(as_tuple=True) if has_image_tokens else (torch.tensor([], device=input_ids.device, dtype=torch.long), torch.tensor([], device=input_ids.device, dtype=torch.long))
+        im_start_pos_list = list(zip(im_start_positions[0].tolist(), im_start_positions[1].tolist())) if has_image_tokens else []
+        im_end_pos_list = list(zip(im_end_positions[0].tolist(), im_end_positions[1].tolist())) if has_image_tokens else []
+
         last_hidden_states = output_hidden_states[-1]
         if self.use_bidir_bio:
             # pad attention_masks with 255 1's to match the input_ids
-            img_tok_offset_attention_masks = torch.cat([torch.ones((attention_masks.shape[0], IMAGE_TOKENS_OFFSET), device=attention_masks.device), attention_masks], dim=1)            
+            img_tok_offset_attention_masks = torch.cat([torch.ones((attention_masks.shape[0], IMAGE_TOKENS_OFFSET), device=attention_masks.device), attention_masks], dim=1)
             bidir_last_hidden_states = self.bio_encoder(last_hidden_states, attention_mask=img_tok_offset_attention_masks)
         else:
             bidir_last_hidden_states = last_hidden_states
 
-        # NOTE: Hacky fix for IMAGE_TOKEN_INDEX (supposing there is only one image; 256 patch tokens are added in between <im_start> and <im_end>)
-        per_token_labels = torch.cat(
-            [
-                torch.zeros((per_token_labels.shape[0], IMAGE_TOKENS_OFFSET), dtype=per_token_labels.dtype, device=last_hidden_states.device), 
-                per_token_labels
-            ], dim=1
-        )
-        for b, gt_positions in enumerate(mask_positions_in_input_ids):
-            mask_positions_in_input_ids[b] = [pos + IMAGE_TOKENS_OFFSET for pos in gt_positions]
+        if IMAGE_TOKENS_OFFSET > 0:
+            # NOTE: Hacky fix for IMAGE_TOKEN_INDEX (supposing there is only one image; 256 patch tokens are added in between <im_start> and <im_end>)
+            per_token_labels = torch.cat(
+                [
+                    torch.zeros((per_token_labels.shape[0], IMAGE_TOKENS_OFFSET), dtype=per_token_labels.dtype, device=last_hidden_states.device),
+                    per_token_labels
+                ], dim=1
+            )
+            for b, gt_positions in enumerate(mask_positions_in_input_ids):
+                mask_positions_in_input_ids[b] = [pos + IMAGE_TOKENS_OFFSET for pos in gt_positions]
 
         sam_proj_hidden_states = self.model.text_hidden_fcs[0](last_hidden_states) # [256, num_tokens]
         # sam_proj_hidden_states = self.model.text_hidden_fcs[0](bidir_last_hidden_states)  # NOTE: so far, 'last_hidden_states' gave best performance
         seg_logits = self.model.token_to_mask_fcs[0](bidir_last_hidden_states)
-        
+
         # NOTE: Avoiding seg_cls_loss for VQADataset instances to alleviate 'O'-class bias
         has_io_lbls = per_token_labels.sum(dim=-1).bool()
         if has_io_lbls.sum() > 0:
@@ -619,10 +685,8 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
                 cls_weights = torch.tensor(self.seg_cls_loss_per_cls_weight, device=seg_logits.device).to(seg_logits.dtype)
             else:
                 cls_weights = None
-            
-            if self.use_crf_bio:  # seg_logits - emissions ; per_token_labels - provide targets as well as the transition probability
-                seg_cls_loss = -self.crf(seg_logits, per_token_labels, mask=img_tok_offset_attention_masks.bool(), reduction='mean')
-            elif self.pred_binary_span:
+
+            if self.pred_binary_span:
                 per_token_labels[per_token_labels == 2] = 1  # convert 2's in per_token_labels to 1's since it's binary case
                 logits_bin = seg_logits[has_io_lbls].view(-1)
                 labels_bin = per_token_labels[has_io_lbls].float().view(-1)
@@ -635,30 +699,20 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
                 )
             else:
                 seg_cls_loss = F.cross_entropy(
-                    seg_logits[has_io_lbls].view(-1, 3), 
-                    per_token_labels[has_io_lbls].view(-1), 
+                    seg_logits[has_io_lbls].view(-1, 3),
+                    per_token_labels[has_io_lbls].view(-1),
                     weight=cls_weights
                 )  # calculate the bce between the seg_scores and gt_parts
         else:
             seg_cls_loss = torch.tensor(0.0, device=seg_logits.device)
-        
-        if self.use_bidir_bio and self.use_crf_bio:
-            # convert img_tok_offset_attention_masks to torch bool type
-            pred_seg_label_list = self.crf.decode(seg_logits, mask=img_tok_offset_attention_masks.bool())
-            pred_seg_labels = []
-            for decoded_lbl in pred_seg_label_list:
-                if len(decoded_lbl) < seg_logits.shape[1]:
-                    decoded_lbl.extend([0] * (seg_logits.shape[1] - len(decoded_lbl)))
-                pred_seg_labels.append(decoded_lbl)
-            pred_seg_labels = torch.tensor(pred_seg_labels, device=seg_logits.device, dtype=seg_logits.dtype)
-        else:
-            pred_seg_labels = torch.argmax(seg_logits, dim=-1)
+
+        pred_seg_labels = torch.argmax(seg_logits, dim=-1)
 
         bio_per_cls_counts_dict = compute_bio_per_class_counts(pred_seg_labels, per_token_labels, self.num_token_classes)
-        
-        # print("(PLUM.py) >> pred_seg_labels:\n", pred_seg_labels)
-        # print("\n(PLUM.py) >> per_token_labels:\n", per_token_labels)
-        
+
+        # print("(PIXAR.py) >> pred_seg_labels:\n", pred_seg_labels)
+        # print("\n(PIXAR.py) >> per_token_labels:\n", per_token_labels)
+
         if self.use_teacher_ref or self.use_cross_attn_bio:
             (
                 t_input_ids,
@@ -689,7 +743,7 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
                         inputs_embeds=t_inputs_embeds,
                         output_hidden_states=True,
                         return_dict=return_dict
-                    )                        
+                    )
                 teacher_last_hidden_states = teacher_outputs.hidden_states[-1]
                 assert teacher_last_hidden_states.shape == last_hidden_states.shape
         else:
@@ -706,113 +760,147 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
         pred_masks = []
         gt_masks = []
         BIO_INTERM_LBL = 2 if not self.pred_binary_span else 1
-        
-        for batch_idx in range(len(offset) - 1):  # batch-level iteration
-            # e.g., offset = [0, 7, 8] - 0-6 for conversations in batch 0, 7-8 for conversations in batch 1
-            start = offset[batch_idx]
-            end = offset[batch_idx + 1]
-            is_mask_per_conv = ((end - start) == masks_list[batch_idx].size(0))   # for refer_seg, sem_seg, reason_seg datasets (and explanatory_seg in case there is only one mask per conv)
-            
-            for conv_idx in range(start, end):  # conv-level interation
-                token_labels_b = per_token_labels[conv_idx]
-                gt_positions = mask_positions_in_input_ids[conv_idx]
-                
-                if masks_list[batch_idx].shape[0] == 0:  # VQADataset does not have masks
-                    continue
-                elif is_mask_per_conv:  # a mask for each conversation (refer_seg, sem_seg, reason_seg)
-                    gt_mask = masks_list[batch_idx][conv_idx - start].unsqueeze(0)  # [1, H, W]
-                
-                span_embeds_l = []
-                masks_l = []
-                # Group over BIO spans
-                for mask_span_idx, pos in enumerate(gt_positions):
-                    assert_msg = f">> original pos: {pos - IMAGE_TOKENS_OFFSET}\n==\nper_token_labels (len={len(token_labels_b[IMAGE_TOKENS_OFFSET:])}): {token_labels_b[IMAGE_TOKENS_OFFSET:]}\n==\ninput_ids (len={len(input_ids)}): {input_ids[conv_idx]}"
-                    try:
-                        assert token_labels_b[pos].item() == BIO_START_LBL, assert_msg
-                    except AssertionError as e:
-                        print(e)
-                        raise RuntimeError(f"[PLUM: model_forward()] BIO-span alignment failed: {e}")
-                    
-                    indices = [pos]
-                    j = pos + 1
-                    while j < token_labels_b.size(0) and token_labels_b[j].item() == BIO_INTERM_LBL:
-                        indices.append(j)
-                        j += 1
-                    
-                    current_group_hidden = last_hidden_states[conv_idx, indices, :]
-                    if self.use_teacher_ref:
-                        cached_group_hidden = teacher_last_hidden_states[conv_idx, indices, :]
-                        group_kl_loss = kl_divergence_loss(cached_group_hidden, current_group_hidden, sigma=1.0)
-                    else:
-                        group_kl_loss = torch.tensor(0.0, device=last_hidden_states.device)
 
-                    # input layer proj. image embeddings are the key and values and query is the bio spans
-                    if self.use_cross_attn_bio:
-                        im_start_pos = im_start_pos_list[conv_idx][1]
-                        im_end_pos = im_end_pos_list[conv_idx][1]                            
-                        # key_value = last_hidden_states[conv_idx][im_start_pos + 1 : im_end_pos + IMAGE_TOKENS_OFFSET, :].unsqueeze(1)  # sample last_hidden_states that correspond to image patches
-                        key_value = t_inputs_embeds[conv_idx][im_start_pos + 1 : im_end_pos + IMAGE_TOKENS_OFFSET, :].unsqueeze(1)  # image embeddings  # XXX If we want to use pre-LLM image embeds
-                        query = current_group_hidden.unsqueeze(1)
-                        cross_attn_bio_embeds = self.bio_cross_attn(query, key_value)
-                        cross_attn_group_proj = self.model.text_hidden_fcs[0](cross_attn_bio_embeds.squeeze(1))
+        if not has_image_tokens:
+            group_count = 0
+        else:
+            for batch_idx in range(len(offset) - 1):  # batch-level iteration
+                # e.g., offset = [0, 7, 8] - 0-6 for conversations in batch 0, 7-8 for conversations in batch 1
+                start = offset[batch_idx]
+                end = offset[batch_idx + 1]
+                is_mask_per_conv = ((end - start) == masks_list[batch_idx].size(0))   # for refer_seg, sem_seg, reason_seg datasets (and explanatory_seg in case there is only one mask per conv)
 
-                    batch_kl_loss += group_kl_loss
-                    
-                    if self.use_cross_attn_bio:
-                        group_proj = cross_attn_group_proj.mean(dim=0)
-                    else:
-                        group_proj = sam_proj_hidden_states[conv_idx, indices, :].mean(dim=0)  # text embeddings for BIO spans
-                    
-                    if not is_mask_per_conv:  # for explanatory_seg dataset where there are multiple masks per conversation
-                        if mask_span_idx < masks_list[batch_idx].shape[0]:
-                            gt_mask = masks_list[batch_idx][mask_span_idx].unsqueeze(0)  # [1, H, W]
+                for conv_idx in range(start, end):  # conv-level interation
+                    token_labels_b = per_token_labels[conv_idx]
+                    gt_positions = mask_positions_in_input_ids[conv_idx]
+
+                    if masks_list[batch_idx].shape[0] == 0:  # VQADataset does not have masks
+                        continue
+                    elif is_mask_per_conv:  # a mask for each conversation (refer_seg, sem_seg, reason_seg)
+                        gt_mask = masks_list[batch_idx][conv_idx - start].unsqueeze(0)  # [1, H, W]
+
+                    span_embeds_l = []
+                    masks_l = []
+                    # Group over BIO spans
+                    for mask_span_idx, pos in enumerate(gt_positions):
+                        assert_msg = f">> original pos: {pos - IMAGE_TOKENS_OFFSET}\n==\nper_token_labels (len={len(token_labels_b[IMAGE_TOKENS_OFFSET:])}): {token_labels_b[IMAGE_TOKENS_OFFSET:]}\n==\ninput_ids (len={len(input_ids)}): {input_ids[conv_idx]}"
+                        try:
+                            assert token_labels_b[pos].item() == BIO_START_LBL, assert_msg
+                        except AssertionError as e:
+                            print(e)
+                            raise RuntimeError(f"[PIXAR: model_forward()] BIO-span alignment failed: {e}")
+
+                        indices = [pos]
+                        j = pos + 1
+                        while j < token_labels_b.size(0) and token_labels_b[j].item() == BIO_INTERM_LBL:
+                            indices.append(j)
+                            j += 1
+
+                        current_group_hidden = last_hidden_states[conv_idx, indices, :]
+                        if self.use_teacher_ref:
+                            cached_group_hidden = teacher_last_hidden_states[conv_idx, indices, :]
+                            group_kl_loss = kl_divergence_loss(cached_group_hidden, current_group_hidden, sigma=1.0)
                         else:
-                            try:
-                                raise ValueError(f"Mask index out of bounds: gt_mask (shape): {gt_mask.shape} | masks_list[batch_idx] (shape): {masks_list[batch_idx].shape}")
-                            except ValueError as e:
-                                print(e)
-                                raise RuntimeError(f"[PLUM: model_forward()] {e}")
+                            group_kl_loss = torch.tensor(0.0, device=last_hidden_states.device)
 
-                    image_emb = image_embeddings[batch_idx].unsqueeze(0)
-                    
-                    # run the SAM prompt encoder and mask decoder with these inputs - NOTE: Why don't we try SAM2 to see if the IoU improves?
-                    sparse_embeddings, dense_embeddings = self.model.visual_model.prompt_encoder(
-                        points=None, boxes=None, masks=None, text_embeds=group_proj.unsqueeze(0).unsqueeze(0)
-                    )
-                    if self.use_feedback_loop:
-                        dense_embeddings = self.mask_pooler(span_embeds_l, masks_l)
+                        # input layer proj. image embeddings are the key and values and query is the bio spans
+                        if self.use_cross_attn_bio:
+                            im_start_pos = im_start_pos_list[conv_idx][1]
+                            im_end_pos = im_end_pos_list[conv_idx][1]
+                            # key_value = last_hidden_states[conv_idx][im_start_pos + 1 : im_end_pos + IMAGE_TOKENS_OFFSET, :].unsqueeze(1)  # sample last_hidden_states that correspond to image patches
+                            key_value = t_inputs_embeds[conv_idx][im_start_pos + 1 : im_end_pos + IMAGE_TOKENS_OFFSET, :].unsqueeze(1)  # image embeddings  # XXX If we want to use pre-LLM image embeds
+                            query = current_group_hidden.unsqueeze(1)
+                            cross_attn_bio_embeds = self.bio_cross_attn(query, key_value)
+                            cross_attn_group_proj = self.model.text_hidden_fcs[0](cross_attn_bio_embeds.squeeze(1))
 
-                    sparse_embeddings = sparse_embeddings.to(group_proj.dtype)
-                    low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
-                        image_embeddings=image_emb,
-                        image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
-                        sparse_prompt_embeddings=sparse_embeddings,
-                        dense_prompt_embeddings=dense_embeddings,
-                        multimask_output=False,
-                    )
-                    pred_mask = self.model.visual_model.postprocess_masks(
-                        low_res_masks,
-                        input_size=resize_list[batch_idx],
-                        original_size=label_list[batch_idx].shape,
-                    )
+                        batch_kl_loss += group_kl_loss
 
-                    # Continue computing dice loss and BCE loss etc.
-                    if self.dice_type == "dice":
-                        group_seg_loss = dice_loss(pred_mask[:, 0], gt_mask.float(), num_masks=1, scale=self.dice_scale_factor)
-                    elif self.dice_type == "focal_tversky":
-                        group_seg_loss = focal_tversky_loss(pred_mask[:, 0], gt_mask.float(), num_masks=1, alpha=self.focal_tversky_alpha, beta=self.focal_tversky_beta)
-                    group_bce_loss = sigmoid_ce_loss(pred_mask[:, 0], gt_mask.float(), num_masks=1)
-                    batch_seg_loss += group_seg_loss
-                    batch_bce_loss += group_bce_loss
-                    group_count += 1
+                        if self.use_cross_attn_bio:
+                            group_proj = cross_attn_group_proj.mean(dim=0)
+                        else:
+                            group_proj = sam_proj_hidden_states[conv_idx, indices, :].mean(dim=0)  # text embeddings for BIO spans
 
-                    if self.use_feedback_loop:
-                        span_embeds_l.append(group_proj.squeeze())
-                        masks_l.append(low_res_masks.squeeze())
+                        if not is_mask_per_conv:  # for explanatory_seg dataset where there are multiple masks per conversation
+                            if mask_span_idx < masks_list[batch_idx].shape[0]:
+                                gt_mask = masks_list[batch_idx][mask_span_idx].unsqueeze(0)  # [1, H, W]
+                            else:
+                                try:
+                                    raise ValueError(f"Mask index out of bounds: gt_mask (shape): {gt_mask.shape} | masks_list[batch_idx] (shape): {masks_list[batch_idx].shape}")
+                                except ValueError as e:
+                                    print(e)
+                                    raise RuntimeError(f"[PIXAR: model_forward()] {e}")
 
-                    pred_masks.append(pred_mask[:, 0])
-                    gt_masks.append(gt_mask)
-                    
+                        image_emb = image_embeddings[batch_idx].unsqueeze(0)
+
+                        # run the SAM prompt encoder and mask decoder with these inputs - NOTE: Why don't we try SAM2 to see if the IoU improves?
+                        sparse_embeddings, dense_embeddings = self.model.visual_model.prompt_encoder(
+                            points=None, boxes=None, masks=None, text_embeds=group_proj.unsqueeze(0).unsqueeze(0)
+                        )
+                        if self.use_feedback_loop:
+                            dense_embeddings = self.mask_pooler(span_embeds_l, masks_l)
+
+                        sparse_embeddings = sparse_embeddings.to(group_proj.dtype)
+                        low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
+                            image_embeddings=image_emb,
+                            image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
+                            sparse_prompt_embeddings=sparse_embeddings,
+                            dense_prompt_embeddings=dense_embeddings,
+                            multimask_output=False,
+                        )
+                        pred_mask = self.model.visual_model.postprocess_masks(
+                            low_res_masks,
+                            input_size=resize_list[batch_idx],
+                            original_size=label_list[batch_idx].shape,
+                        )
+
+                        # Continue computing dice loss and BCE loss etc.
+                        if self.dice_type == "dice":
+                            group_seg_loss = dice_loss(pred_mask[:, 0], gt_mask.float(), num_masks=1, scale=self.dice_scale_factor)
+                        elif self.dice_type == "focal_tversky":
+                            group_seg_loss = focal_tversky_loss(pred_mask[:, 0], gt_mask.float(), num_masks=1, alpha=self.focal_tversky_alpha, beta=self.focal_tversky_beta)
+                        group_bce_loss = sigmoid_ce_loss(pred_mask[:, 0], gt_mask.float(), num_masks=1)
+                        batch_seg_loss += group_seg_loss
+                        batch_bce_loss += group_bce_loss
+                        group_count += 1
+
+                        if self.use_feedback_loop:
+                            span_embeds_l.append(group_proj.squeeze())
+                            masks_l.append(low_res_masks.squeeze())
+
+                        pred_masks.append(pred_mask[:, 0])
+                        gt_masks.append(gt_mask)
+
+
+        # no-op pass through SAM when no spans this step - prevent multi-gpu hanging
+        if has_image_tokens and group_count == 0:
+            # fabricate a single dummy query + single image emb to run prompt+decoder
+            # (all multiplied by 0 later; this only anchors the graph for grad compute)
+            sam_dtype = next(self.model.visual_model.mask_decoder.parameters()).dtype
+            with torch.no_grad():
+                image_emb = self.get_visual_embs(images[:1]).to(sam_dtype)
+            dummy_query = self.model.text_hidden_fcs[0](last_hidden_states[:1, :1, :]).mean(dim=1)  # [1, out_dim]
+            dummy_query = dummy_query.to(sam_dtype)
+            sparse_embeddings, dense_embeddings = self.model.visual_model.prompt_encoder(
+                points=None, boxes=None, masks=None, text_embeds=dummy_query.unsqueeze(0)
+            )
+            pe = self.model.visual_model.prompt_encoder
+            sparse_embeddings, dense_embeddings = pe(
+                points=None, boxes=None, masks=None,
+                text_embeds=dummy_query.unsqueeze(0)
+            )
+            sparse_embeddings = sparse_embeddings.to(sam_dtype)
+            dense_embeddings  = dense_embeddings.to(sam_dtype)
+
+            low_res_masks, _ = self.model.visual_model.mask_decoder(
+                image_embeddings=image_emb,
+                image_pe=pe.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=False,
+            )
+            # consume in a zero-weight way so it participates in autograd graph
+            _ = (low_res_masks.sum() * 0.0)
+
         if group_count > 0:
             avg_kl_loss = batch_kl_loss / group_count
             avg_seg_loss = batch_seg_loss / group_count
@@ -821,7 +909,7 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
             avg_kl_loss = torch.tensor(0.0, device=last_hidden_states.device)
             avg_seg_loss = torch.tensor(0.0, device=last_hidden_states.device)
             avg_bce_loss = torch.tensor(0.0, device=last_hidden_states.device)
-            
+
         if inference:
             final_loss = None
         else:
@@ -831,7 +919,11 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
                         + self.dice_loss_weight * avg_seg_loss \
                         + self.bce_loss_weight * avg_bce_loss
 
-        if inference:            
+        # call self._touch_trainable_modules() to prevent hanging in multi-gpu settings
+        if self.training:
+            final_loss = final_loss + self._touch_trainable_modules()
+
+        if inference:
             return {
                 "pred_masks": pred_masks,
                 "gt_masks": gt_masks,
@@ -863,7 +955,7 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
         attention_masks: torch.LongTensor = None,
         gt_bio_span: bool = None,
         max_new_tokens: int = 512,
-        tokenizer: str = None,
+        tokenizer = None,
         multiple_choice: bool = False,
         prompt_user_input: bool = False,
         **kwargs,
@@ -883,10 +975,10 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
         mask_positions_in_input_ids = kwargs.pop("mask_positions_in_input_ids", None)
         # TODO: See what's the difference between this and the model_forward() function
         # TODO: There is a big performance drop when using this function
-        
+
         '''
         Evaluate the model in inference mode.
-        
+
         This function performs the following steps:
         1. Generates output sequences with hidden states.
         2. Computes segmentation logits for each token.
@@ -896,7 +988,7 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
             For each span, aggregates the corresponding token embeddings (mean pooling).
         5. For each aggregated query, runs the SAM prompt encoder and mask decoder
             (using the image embeddings) to predict a segmentation mask.
-        
+
         Returns:
         A dictionary with:
             - "output_ids": the generated token sequences.
@@ -908,10 +1000,14 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
             - "prompt_user_input": a boolean indicating if the user input is required (in case pred_seg_labels is all 0's).
         '''
         num_generated_tokens = 0
-        IMAGE_TOKENS_OFFSET = 255
         im_start_id = tokenizer.convert_tokens_to_ids(DEFAULT_IM_START_TOKEN)
         im_end_id   = tokenizer.convert_tokens_to_ids(DEFAULT_IM_END_TOKEN)
-        
+        has_image_tokens = (input_ids == im_start_id).any()
+        IMAGE_TOKENS_OFFSET = 255 if has_image_tokens else 0
+
+        if attention_masks is None:
+            attention_masks = input_ids.ne(self.config.pad_token_id).long()
+
         # NOTE: The way the baseline code did it:
         # "USER: <img_start> <image> <img_end> What is this?"
         #  0       1           2        3
@@ -947,6 +1043,7 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
                     num_beams=1,
                     output_hidden_states=True,
                     return_dict_in_generate=True,
+                    use_cache=False,
                 )
                 output_ids = outputs.sequences
                 output_ids_fixed = output_ids.clone()
@@ -954,30 +1051,35 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
                 output_hidden_states = outputs.hidden_states[-1]  # [bsz, seq_len, d_model] - 'seq_len' = 'len(input_ids)' + IMAGE_TOKENS_OFFSET + 'num_generated_tokens' - 1 (-1 because early break occurs when </s> is generated)
                 output_ids_trunc = output_ids_fixed[0][input_ids.size(1):].unsqueeze(0)
                 num_generated_tokens = output_ids_trunc.size(1)
-                
+
             if self.use_bidir_bio:
-                # pad attention_masks with 255 1's to match the input_ids
-                attention_mask_offset = IMAGE_TOKENS_OFFSET if multiple_choice else IMAGE_TOKENS_OFFSET + num_generated_tokens - 1
-                img_tok_offset_attention_masks = torch.cat(
-                    [
-                        torch.ones((attention_masks.shape[0], attention_mask_offset), device=attention_masks.device), attention_masks
-                    ], dim=1)
+                base_offset = IMAGE_TOKENS_OFFSET
+                gen_offset = (max(num_generated_tokens - 1, 0) if not multiple_choice else 0)
+                attention_mask_offset = base_offset + gen_offset
+                if attention_mask_offset > 0:
+                    pad_ones = torch.ones(
+                        (attention_masks.shape[0], attention_mask_offset),
+                        device=attention_masks.device
+                    )
+                    img_tok_offset_attention_masks = torch.cat([pad_ones, attention_masks], dim=1)
+                else:
+                    img_tok_offset_attention_masks = attention_masks
                 bidir_last_hidden_states = self.bio_encoder(output_hidden_states, attention_mask=img_tok_offset_attention_masks)
             else:
                 bidir_last_hidden_states = output_hidden_states
-            
+
             sam_proj_hidden_states = self.model.text_hidden_fcs[0](output_hidden_states)
             seg_logits = self.model.token_to_mask_fcs[0](bidir_last_hidden_states)
 
             pred_seg_labels = torch.argmax(seg_logits, dim=-1)  # [bsz, seq_len]
-            
+
             if gt_bio_span is None:
                 bio_labels = pred_seg_labels
                 # NOTE: Receive user input and parse last_hidden_states (used as input to the mask decoder)
                 # Use for case demo on "arbitrary" text span groundability on images
-                if prompt_user_input:  # bio_labels.sum(dim=-1) == 0 and 
+                if prompt_user_input:  # bio_labels.sum(dim=-1) == 0 and
                     model_output_txt = tokenizer.decode(output_ids_trunc[0], skip_special_tokens=False)
-                    user_spans = input(f"[ PLUM Output ]\n>>\n{model_output_txt}\n\n>>\n>> Please input the text span you want to see highlighted (e.g., wings, cockpit): ")
+                    user_spans = input(f"[ PIXAR Output ]\n>>\n{model_output_txt}\n\n>>\n>> Please input the text span you want to see highlighted (e.g., wings, cockpit): ")
                     user_span_txts = [s.strip() for s in user_spans.split(',')]
                     user_span_pos = []
                     for s in user_span_txts:
@@ -987,7 +1089,7 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
                                 bio_labels[0][i] = BIO_START_LBL
                                 for j in range(i + 1, i + len(tok_span_ids)):
                                     bio_labels[0][j] = BIO_INTERM_LBL
-                                user_span_pos.append((i, i + len(tok_span_ids)))                      
+                                user_span_pos.append((i, i + len(tok_span_ids)))
             else:
                 bio_labels = gt_bio_span
                 # pad bio_labels with 0's to match dim=1 of output_hidden_states
@@ -1000,7 +1102,7 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
             # for each sample, extract token spans based on predicted BIO labels.
             def aggregate_bio_spans(
                         batch_idx: int,
-                        pred_lbls: list, 
+                        pred_lbls: list,
                         seq_len: int = -1,
                         tokenizer = None,
                         aggregate_interm_lbl: bool = False,  # NOTE: True only when we want to aggregate faulty span of only 2's
@@ -1010,7 +1112,7 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
                 span_texts = []
                 span_embeddings = []  # aggregated embeddings (mean-pooled over the span).
                 bio_start_flag = False
-                
+
                 if seq_len != -1:
                     assert pred_lbls.size(0) == seq_len, \
                         f"pred_lbls.size(0)={pred_lbls.size(0)} != seq_len={seq_len}"
@@ -1025,7 +1127,7 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
                         # For generation, output_ids_trunc only contains generated tokens
                         # Map from full sequence indices to generated token indices
                         input_seq_len = input_ids.size(1) + IMAGE_TOKENS_OFFSET
-                        
+
                         # Check if span is within the generated tokens
                         if start_idx >= input_seq_len and end_idx <= input_seq_len + output_ids_trunc.size(1):
                             span_start_gen = start_idx - input_seq_len
@@ -1034,7 +1136,7 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
                             return tokenizer.decode(span_ids, skip_special_tokens=False)
                         else:
                             return ""  # Span is not in generated tokens
-                        
+
                 log_texts = []
 
                 for tok_idx, bio_lbl in enumerate(pred_lbls.tolist()):
@@ -1048,11 +1150,11 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
                             span_text = decode_span_text(start, end)
                             log_texts.append(f"start: {start}, end: {end}, span_text: {span_text}")
                             span_texts.append(span_text)
-                        # start a new span    
+                        # start a new span
                         start = tok_idx
                         indices = [tok_idx]
                         bio_start_flag = True
-                        
+
                     elif bio_lbl == BIO_INTERM_LBL:
                         if bio_start_flag:
                             indices.append(tok_idx)
@@ -1060,7 +1162,7 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
                             start = tok_idx
                             indices = [tok_idx]
                             bio_start_flag = True
-                            
+
                     elif bio_lbl == BIO_NO_LBL:
                         if bio_start_flag:
                             end = tok_idx
@@ -1073,7 +1175,7 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
                             span_texts.append(span_text)
 
                 print(f">> log_texts: {log_texts}")
-                            
+
                 # Handle case where sequence ends with a span (bio_start_flag is still True)
                 if bio_start_flag:
                     end = len(pred_lbls.tolist())
@@ -1082,76 +1184,83 @@ class PLUMForCausalLM(LlavaLlamaForCausalLM):
                     span_embeddings.append(span_emb)
                     span_text = decode_span_text(start, end)
                     span_texts.append(span_text)
-                            
+
                 return {
                     'spans': spans,
                     'span_texts': span_texts,
                     'embeddings': span_embeddings
                 }
-            
+
             output_dicts = []
             for batch_idx in range(output_hidden_states.size(0)):
                 output_dict = aggregate_bio_spans(
                     batch_idx,
-                    bio_labels[batch_idx], 
-                    seq_len=output_hidden_states.size(1), 
+                    bio_labels[batch_idx],
+                    seq_len=output_hidden_states.size(1),
                     tokenizer=tokenizer,
                     aggregate_interm_lbl=False  # NOTE: True only when we want to aggregate faulty span of only 2's
                 )
                 output_dicts.append(output_dict)
-            
-            image_embeddings = self.get_visual_embs(images)  # [bsz, c, H, W]
+
+            # mask prediction block
             batch_pred_masks = []
             batch_iou_predictions = []
-            
-            # during inference, we deal with a single image with multiple answer choices
-            image_embeddings = image_embeddings.expand(input_ids.size(0), -1, -1, -1).contiguous()
-            
-            for batch_idx, output_dict in enumerate(output_dicts):
-                iou_predictions_list = []
-                pred_masks = []
-                span_embeds_l = []
-                masks_l = []
-                for span_emb in output_dict["embeddings"]:  # len(span_emb) = # of detected spans
-                    image_emb = image_embeddings[batch_idx].unsqueeze(0)
-                    text_embed = span_emb.unsqueeze(0).unsqueeze(0)
-                    # Use the SAM prompt encoder to obtain sparse and dense embeddings.
-                    sparse_embeddings, dense_embeddings = self.model.visual_model.prompt_encoder(
-                        points=None, boxes=None, masks=None, text_embeds=text_embed
-                    )
-                    if self.use_feedback_loop:
-                        dense_embeddings = self.mask_pooler(span_embeds_l, masks_l)
-                        
-                    sparse_embeddings = sparse_embeddings.to(span_emb.dtype)
-                    # Use the mask decoder with the image embeddings.
-                    low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
-                        image_embeddings=image_emb,
-                        image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
-                        sparse_prompt_embeddings=sparse_embeddings,
-                        dense_prompt_embeddings=dense_embeddings,
-                        multimask_output=False,
-                    )
-                    # Postprocess the low-resolution masks to the desired size.
-                    try:
-                        resize_dim = resize_list[0]
-                        original_size = label_list[0] if isinstance(label_list[0], tuple) else tuple(label_list[0].shape)
-                    except IndexError as e:
-                        print(f"IndexError: {e}")
-                        raise RuntimeError(f"[PLUM: evaluate()] {e}")
-                    
-                    pred_mask = self.model.visual_model.postprocess_masks(
-                        low_res_masks,
-                        input_size=resize_dim,
-                        original_size=original_size,
-                    )
-                    if self.use_feedback_loop:
-                        span_embeds_l.append(span_emb.squeeze())
-                        masks_l.append(low_res_masks.squeeze())
-                        
-                    pred_masks.append(pred_mask[:, 0])
-                    iou_predictions_list.append(iou_predictions.item())
-                batch_pred_masks.append(pred_masks)
-                batch_iou_predictions.append(iou_predictions_list)
+
+            if has_image_tokens:
+                image_embeddings = self.get_visual_embs(images)  # [bsz, c, H, W]
+                image_embeddings = image_embeddings.expand(input_ids.size(0), -1, -1, -1).contiguous()  # during inference, we deal with a single image with multiple answer choices
+
+                for batch_idx, output_dict in enumerate(output_dicts):
+                    iou_predictions_list = []
+                    pred_masks = []
+                    span_embeds_l = []
+                    masks_l = []
+                    for span_emb in output_dict["embeddings"]:  # len(span_emb) = # of detected spans
+                        image_emb = image_embeddings[batch_idx].unsqueeze(0)
+                        text_embed = span_emb.unsqueeze(0).unsqueeze(0)
+                        # Use the SAM prompt encoder to obtain sparse and dense embeddings.
+                        sparse_embeddings, dense_embeddings = self.model.visual_model.prompt_encoder(
+                            points=None, boxes=None, masks=None, text_embeds=text_embed
+                        )
+                        if self.use_feedback_loop:
+                            dense_embeddings = self.mask_pooler(span_embeds_l, masks_l)
+
+                        sparse_embeddings = sparse_embeddings.to(span_emb.dtype)
+                        # Use the mask decoder with the image embeddings.
+                        low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
+                            image_embeddings=image_emb,
+                            image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
+                            sparse_prompt_embeddings=sparse_embeddings,
+                            dense_prompt_embeddings=dense_embeddings,
+                            multimask_output=False,
+                        )
+                        # Postprocess the low-resolution masks to the desired size.
+                        try:
+                            resize_dim = resize_list[0]
+                            original_size = label_list[0] if isinstance(label_list[0], tuple) else tuple(label_list[0].shape)
+                        except IndexError as e:
+                            print(f"IndexError: {e}")
+                            raise RuntimeError(f"[PIXAR: evaluate()] {e}")
+
+                        pred_mask = self.model.visual_model.postprocess_masks(
+                            low_res_masks,
+                            input_size=resize_dim,
+                            original_size=original_size,
+                        )
+                        if self.use_feedback_loop:
+                            span_embeds_l.append(span_emb.squeeze())
+                            masks_l.append(low_res_masks.squeeze())
+
+                        pred_masks.append(pred_mask[:, 0])
+                        iou_predictions_list.append(iou_predictions.item())
+
+                    batch_pred_masks.append(pred_masks)
+                    batch_iou_predictions.append(iou_predictions_list)
+
+            else:  # text-only case (no image in the input; no mask to predict)
+                n = output_hidden_states.size(0)
+                batch_pred_masks = [[] for _ in range(n)]
+                batch_iou_predictions = [[] for _ in range(n)]
 
         return {
             "output_ids": output_ids_trunc if not multiple_choice else None,
