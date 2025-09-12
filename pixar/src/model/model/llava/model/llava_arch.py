@@ -194,6 +194,15 @@ class LlavaMetaForCausalLM(ABC):
                 except Exception as e:
                     print(f"Error: {e}")
                     breakpoint()
+                # #####
+                # if isinstance(image_features, list) or (image_features.dim() == 3 and image_features.shape[0] > input_ids.shape[0]):
+                #     # Rare case: concatenated features for multiple images per sample
+                #     cur_image_features = image_features[cur_image_idx]
+                #     cur_image_idx += 1
+                # else:
+                #     # Common case: one image per sample
+                #     cur_image_features = image_features[batch_idx]
+                # #####
 
                 image_token_start = image_token_indices[0]
                 if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(

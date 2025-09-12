@@ -502,6 +502,7 @@ def main(args):
                 "betas": (args.beta1, args.beta2),
                 "torch_adam": True,
             },
+            "torch_adam": True,
         },
         "scheduler": {
             "type": "WarmupDecayLR",

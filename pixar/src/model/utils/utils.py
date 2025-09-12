@@ -24,6 +24,7 @@ SEARCH_START_TOKEN = "<search>"
 SEARCH_END_TOKEN = "</search>"
 INFORMATION_START_TOKEN = "<information>"
 INFORMATION_END_TOKEN = "</information>"
+DEFAULT_IMG_PAYLOAD_TOKEN = "<img>"
 DEFAULT_REGION_TOKEN = "<region>"
 
 QTYPE2ID = {"TEXT": 0, "IMAGE": 1, "REGION": 2}

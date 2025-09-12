@@ -22,7 +22,7 @@ from utils.utils import (
     DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX,
     SEARCH_START_TOKEN, SEARCH_END_TOKEN,
     INFORMATION_START_TOKEN, INFORMATION_END_TOKEN,
-    DEFAULT_REGION_TOKEN
+    DEFAULT_REGION_TOKEN, DEFAULT_IMG_PAYLOAD_TOKEN,
 )
 
 from src.local_search_api import LocalSearchPipeline  # TODO: Revive after fixing the path error
@@ -48,7 +48,7 @@ def parse_args(args):
     p.add_argument("--load_in_8bit", action="store_true", default=False)
     p.add_argument("--load_in_4bit", action="store_true", default=False)
     p.add_argument("--use_mm_start_end", action="store_true", default=True)
-    p.add_argument("--conv_type", default="llava_v1", choices=["llava_v1", "llava_llama_2"])
+    p.add_argument("--conv_type", default="llava_v1", choices=["llava_v1", "llava_llama_2", "pixar_0shot_v1"])
     p.add_argument("--use_bidir_bio", action="store_true", default=False)
     p.add_argument("--use_feedback_loop", action="store_true", default=False)
     p.add_argument("--prompt_user_input", action="store_true", default=False)
@@ -78,54 +78,73 @@ def preprocess(
 
 
 # helpers for interrupted decoding after <search> token
-def _decode_tail(tokenizer, ids: torch.Tensor, k: int = 256) -> str:
-    '''
-    helper to decode only the most recent window of tokens instead of the entire prompt
-    '''
-    tail = ids[:, max(0, ids.shape[1] - k):]
-    return tokenizer.decode(tail[0], skip_special_tokens=False)
 
-def _append_text_to_ids(tokenizer, input_ids: torch.Tensor, text: str, device) -> torch.Tensor:
+def tokenizer_decode_special_tokens(ids: torch.Tensor, tokenizer) -> List[int]:
+    # map negative/sentinel ids to decodable ids for tokenizer.decode.
+    ids = ids.clone()
+    unk = getattr(tokenizer, "unk_token_id", None) or 0
+    ids[ids == IMAGE_TOKEN_INDEX] = unk
+    if (ids < 0).any():
+        return [int(x if x >= 0 else unk) for x in ids.tolist()]
+    return [int(x) for x in ids.tolist()]
+
+def append_text_to_ids(tokenizer, input_ids: torch.Tensor, text: str, device) -> torch.Tensor:
     new_ids = tokenizer.encode(text, add_special_tokens=False, return_tensors="pt").to(device)
     return torch.cat([input_ids, new_ids], dim=1)
 
-def _extract_closed_payload(text: str, open_tag: str, close_tag: str) -> Optional[Tuple[str, int, int]]:
-    '''
-    Return (payload, open_idx, close_end_idx) for the LAST closed pair, or None.
-    '''
-    open_idx = text.rfind(open_tag)
-    if open_idx == -1:
+def find_sub_ids(hay: torch.Tensor, needle: torch.Tensor, start_idx: int = 0) -> Optional[Tuple[int,int]]:
+    # return [start, end) indices of first occurrence of needle in hay[start_idx:]
+    if needle.numel() == 0: 
         return None
-    close_idx = text.find(close_tag, open_idx + len(open_tag))
-    if close_idx == -1:
-        return None
-    return text[open_idx + len(open_tag):close_idx].strip(), open_idx, close_idx + len(close_tag)
+    H = hay.tolist()
+    N = needle.tolist()
+    for i in range(start_idx, len(H) - len(N) + 1):
+        if H[i:i+len(N)] == N:
+            return (i, i + len(N))
+    return None
 
-def _last_span_before(text: str, anchor: str, max_words: int = 8) -> str:
+def find_last_closed_span_ids(hay: torch.Tensor, start_ids: torch.Tensor, end_ids: torch.Tensor) -> Optional[Tuple[int,int,int,int]]:
+    '''
+    In 1D ids 'hay', find the LAST closed <start> ... <end> pair.
+    Returns (s0, s1, e0, e1) where:
+      hay[s0:s1] == start_ids, hay[e0:e1] == end_ids, and s1 <= e0
+    '''
+    H = hay.tolist()
+    S = start_ids.tolist()
+    E = end_ids.tolist()
+
+    # find last end
+    last_end_start = -1
+    for i in range(len(H) - len(E), -1, -1):
+        if H[i:i+len(E)] == E:
+            last_end_start = i
+            break
+    if last_end_start == -1:
+        return None
+    e0, e1 = last_end_start, last_end_start + len(E)
+
+    # find nearest start before that end
+    nearest_s0 = -1
+    for i in range(e0 - len(S), -1, -1):
+        if H[i:i+len(S)] == S:
+            nearest_s0 = i
+            break
+    if nearest_s0 == -1:
+        return None
+    s0, s1 = nearest_s0, nearest_s0 + len(S)
+
+    if s1 > e0:
+        return None
+    return (s0, s1, e0, e1)
+
+def last_span_before(text: str, anchor: str, max_words: int = 8) -> str:
+    # Get up to N words immediately before `anchor` for region-derived queries
     idx = text.rfind(anchor)
     if idx == -1:
         return ""
     left = text[:idx].strip()
-    toks = re.split(r"\s+", left)
-    return " ".join(toks[-max_words:]).strip()
-
-def _find_subsequence(hay: torch.Tensor, needle: torch.Tensor) -> Optional[Tuple[int, int]]:
-    '''
-    Return [start, end) indices of first occurrence of `needle` in `hay`.
-    Both are 1D Long tensors.
-    '''
-    if needle.numel() == 0 or hay.numel() < needle.numel():
-        return None
-    # naive search (seq length small for generated tails)
-    H, N = hay.tolist(), needle.tolist()
-    for i in range(len(H) - len(N) + 1):
-        if H[i:i+len(N)] == N:
-            return (i, i+len(N))
-    return None
-
-def _ensure_dir(d):
-    os.makedirs(d, exist_ok=True)
-    return d
+    tokens = re.split(r"\s+", left)
+    return " ".join(tokens[-max_words:]).strip()
 
 
 def save_cropped_region(mask_bool: np.ndarray, rgb_image: np.ndarray, out_dir: str, base_name: str, idx: int) -> str:
@@ -140,14 +159,14 @@ def save_cropped_region(mask_bool: np.ndarray, rgb_image: np.ndarray, out_dir: s
     ys, xs = np.where(mask_bool)
     if len(ys) == 0:
         # fall back to whole image if mask is empty
-        out_path = os.path.join(_ensure_dir(out_dir), f"{base_name}_region_{idx}_fallback.png")
+        out_path = os.path.join(out_dir, f"{base_name}_region_{idx}_fallback.png")
         cv2.imwrite(out_path, cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR))
         return out_path
 
     y1, y2 = ys.min(), ys.max()
     x1, x2 = xs.min(), xs.max()
     crop = rgb_image[y1:y2+1, x1:x2+1, :]
-    out_path = os.path.join(_ensure_dir(out_dir), f"{base_name}_region_{idx}.png")
+    out_path = os.path.join(out_dir, f"{base_name}_region_{idx}.png")
     cv2.imwrite(out_path, cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
     return out_path
 
@@ -156,7 +175,7 @@ def generate_with_tools(
     model: PIXARForCausalLM,
     tokenizer,
     images_clip: torch.Tensor,
-    image_tensor_for_seg: torch.Tensor,  # preprocessed sam input (B=1, C,H,W)
+    image_tensor_for_seg: torch.Tensor,  # preprocessed sam input (bsz=1, c,h,w)
     image_np_rgb: np.ndarray, # original RGB image
     image_path: str,
     input_ids: torch.Tensor,
@@ -180,10 +199,14 @@ def generate_with_tools(
     model.eval()
     device = device or input_ids.device
     eos_id = tokenizer.eos_token_id
+    SEARCH_START_IDS = torch.tensor(tokenizer.encode(SEARCH_START_TOKEN, add_special_tokens=False)).detach().cpu().long()
+    SEARCH_END_IDS = torch.tensor(tokenizer.encode(SEARCH_END_TOKEN, add_special_tokens=False)).detach().cpu().long()
+    IMG_IDS = torch.tensor(tokenizer.encode(DEFAULT_IMG_PAYLOAD_TOKEN, add_special_tokens=False)).detach().cpu().long()
+    REGION_IDS = torch.tensor(tokenizer.encode(DEFAULT_REGION_TOKEN, add_special_tokens=False)).detach().cpu().long()
 
     generated = input_ids.clone()
     steps = max_new_tokens
-    max_searches = 12
+    max_searches = 5
     search_count = 0
 
     # track only the generated segment (excluding the prompt ids)
@@ -207,64 +230,64 @@ def generate_with_tools(
         if new_tok == eos_id:
             break
 
-        # check for closed <search> ... </search> in tail
-        tail_txt = _decode_tail(tokenizer, generated, k=512)
-        payload = _extract_closed_payload(tail_txt, SEARCH_START_TOKEN, SEARCH_END_TOKEN)
-        if payload is None:
+        gen_ids = generated[0, base_len:].detach().cpu().long()
+        gen_text = tokenizer.decode(tokenizer_decode_special_tokens(gen_ids, tokenizer), skip_special_tokens=False)
+        search_span = find_last_closed_span_ids(gen_ids, SEARCH_START_IDS, SEARCH_END_IDS)
+        
+        print(f">> step: {steps}, new_tok: {gen_text}")
+        
+        if search_span is None:
             continue
-
-        payload_text, _, _ = payload
-        search_count += 1
-        if search_count > max_searches:
-            continue
-
-        # decide query kind
-        payload_norm = payload_text.strip().lower()
-
-        # Compute query and (optionally) region crop
-        input_query: Any
-        if payload_norm == DEFAULT_IMAGE_TOKEN:
-            # whole image
+        
+        s0, s1, e0, e1 = search_span
+        payload_ids = gen_ids[s1:e0]
+        payload_text = tokenizer.decode(tokenizer_decode_special_tokens(payload_ids, tokenizer), skip_special_tokens=False)
+        
+        print(f">> step: {steps}, new_tok: {payload_text}")
+        
+        is_image_payload = (payload_ids.tolist() == IMG_IDS.tolist()) or (payload_text == DEFAULT_IMG_PAYLOAD_TOKEN.lower())
+        is_region_payload = (payload_ids.tolist() == REGION_IDS.tolist()) or (payload_text == DEFAULT_REGION_TOKEN.lower())
+        is_text_payload = not is_image_payload and not is_region_payload
+        
+        if is_image_payload:
             input_query = [image_path]
-
-        elif payload_norm == DEFAULT_REGION_TOKEN:
-            # Build gt_bio_span from the span immediately preceding "<search>"
-            # 1) Recover generated-only ids (exclude prompt)
+        elif is_region_payload:
+            # NOTE: This requires sampling mask from the model for the text span immediately before "<search>" or model sampled text span
+            # build gt_bio_span from the span immediately preceding "<search>"
             gen_ids = generated[0, base_len:].detach().cpu()
 
-            # 2) Find the last span text before "<search>"
-            span_text = _last_span_before(tail_txt, SEARCH_START_TOKEN, max_words=8)
+            # find the last span text before "<search>"
+            span_text = last_span_before(gen_text, SEARCH_START_TOKEN, max_words=5)
             span_ids = torch.tensor(tokenizer.encode(span_text, add_special_tokens=False), dtype=gen_ids.dtype)
 
-            # 3) Locate the span in generated ids
-            loc = _find_subsequence(gen_ids, span_ids)
+            # locate the span in generated ids
+            loc = find_sub_ids(generated[0, base_len:], span_ids)
             if loc is None:
-                # if not found, fallback to whole image
-                input_query = [image_path]
+                input_query = [image_path]  # if not found, fallback to whole image
             else:
                 s, e = loc  # on gen_ids
-                # 4) Build gt_bio_span over the *generated* segment length
+                # build gt_bio_span over the generated segment length
                 gt_bio = torch.zeros((1, gen_ids.numel()), dtype=torch.long, device=device)
                 if e - s >= 1:
                     gt_bio[0, s] = 1  # B
                     if e - s > 1:
                         gt_bio[0, s+1:e] = 2  # I
 
-                # 5) Call evaluate() to get mask(s) for that span
+                # call evaluate() to get mask(s) for that span
                 # NOTE: evaluate() will re-generate, but we only need masks
                 outputs = model.evaluate(
                     images_clip=images_clip,
                     images=image_tensor_for_seg,
-                    input_ids=input_ids,                       # full prompt ids
+                    input_ids=input_ids,
                     resize_list=[image_np_rgb.shape[:2]],
-                    label_list=[image_np_rgb],                 # shape is inspected; tuple(shape) is taken internally
+                    label_list=[image_np_rgb],
                     attention_masks=attention_masks,
                     gt_bio_span=gt_bio,
-                    max_new_tokens=64,                         # minimal regen
+                    max_new_tokens=64,  # NOTE: set minimal text span length for region crop;
                     tokenizer=tokenizer,
                     prompt_user_input=False,
                 )
-                # 6) Extract first mask and save a cropped region file
+                # extract first mask and save a cropped region file
                 region_path = None
                 try:
                     pm = outputs["pred_masks"][0]
@@ -280,9 +303,14 @@ def generate_with_tools(
                 else:
                     input_query = [region_path]
 
-        else:
-            # textual query
+        elif is_text_payload:
             input_query = payload_text
+        else:
+            raise ValueError(f"Unknown payload type: {payload_text}")
+        
+        search_count += 1
+        if search_count > max_searches:
+            continue
 
         # search tool call
         try:
@@ -291,9 +319,10 @@ def generate_with_tools(
             results = [{"error": str(e), "input_query": input_query}]
 
         injected = f"{INFORMATION_START_TOKEN} {json.dumps(results, ensure_ascii=False)} {INFORMATION_END_TOKEN}"
-        generated = _append_text_to_ids(tokenizer, generated, injected, device)
+        generated = append_text_to_ids(tokenizer, generated, injected, device)
 
-    final_text = tokenizer.decode(generated[0], skip_special_tokens=False)
+    final_text = tokenizer.decode(tokenizer_decode_special_tokens(generated[0], tokenizer), skip_special_tokens=False)
+    
     return generated, final_text
 
 
@@ -434,7 +463,7 @@ def main(args):
         input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt").unsqueeze(0).cuda()
         attention_masks = input_ids.ne(tokenizer.pad_token_id).long()
 
-        # === tool-aware generation ===
+        # <search> tool-aware generation
         final_ids, final_text = generate_with_tools(
             model=model,
             tokenizer=tokenizer,

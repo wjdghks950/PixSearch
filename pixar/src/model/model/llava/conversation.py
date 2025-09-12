@@ -380,8 +380,8 @@ conv_llava_v1_mmtag = Conversation(
 conv_pixar_0shot_v1 = Conversation(
     system="A chat between a curious human and an artificial intelligence assistant. "
     "The assistant gives helpful, detailed, and polite answers to the human's questions. "
-    "Generate <search> token to trigger search API calls and generate a search query right between the <search> </search> tokens.  "
-    "If the user question is better answered with image or region-specific crops, generateion <search> <image> </search>, or <search> <region> </search> accordingly. "
+    "When you need external knowledge to answer a question, generate <search> token to trigger search API calls and generate a search query right between the <search> </search> tokens.  "
+    "If the user question is better answered with image or region-specific crops, generateion <search> <img> </search>, or <search> <region> </search> accordingly. "
     "The retrieved content through search API call will be enclosed between <information> </information>. "
     "Use the retrieved knowledge to answer the user question.",
     roles=("USER", "ASSISTANT"),

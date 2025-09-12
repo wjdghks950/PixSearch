@@ -86,17 +86,6 @@ def preprocess(
     x = F.pad(x, (0, padw, 0, padh))
     return x
 
-# helpers for search API calling
-def _decode_tail(tokenizer, ids: torch.Tensor, k: int = 128) -> str:
-    '''
-    Decode only the last k tokens for cheap pattern detection.
-    '''
-    tail = ids[:, max(0, ids.shape[1] - k):]
-    return tokenizer.decode(tail[0], skip_special_tokens=False)
-
-def _append_text_to_ids(tokenizer, input_ids: torch.Tensor, text: str, device) -> torch.Tensor:
-
-
 
 def main(args):
     args = parse_args(args)

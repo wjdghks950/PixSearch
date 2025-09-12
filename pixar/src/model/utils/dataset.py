@@ -113,7 +113,7 @@ def collate_fn(
     targets = input_ids.clone()
     qtype_labels = torch.full_like(input_ids, fill_value=IGNORE_INDEX)
 
-    if conv_type == "llava_v1":
+    if conv_type in ["llava_v1", "pixar_0shot_v1"]:
         sep = conv.sep + conv.roles[1] + ": "
     else:
         sep = "[/INST] "
