@@ -67,14 +67,18 @@ class VQADataset(torch.utils.data.Dataset):
         self.precision = precision
         self.transform = ResizeLongestSide(image_size)
         self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
-
-        DATA_DIR = os.path.join(base_image_dir, "llava_dataset")
-        self.vqa_image_root = os.path.join(base_image_dir, "coco/train2017")  # for 'llava_instruct_150k.json'
-        with open(os.path.join(DATA_DIR, "{}.json".format(vqa_data))) as f:
-            vqa_data = json.load(f)
         self.vqa_data = vqa_data
 
-        print("vqa_data: ", len(self.vqa_data))
+        DATA_DIR = os.path.join(base_image_dir, "llava_dataset")
+        if vqa_data == "llava_instruct_150k":
+            self.vqa_image_root = os.path.join(base_image_dir, "coco/train2017")  # for 'llava_instruct_150k.json'
+        elif vqa_data == "llava_v1_5_mix665k":
+            self.vqa_image_root = base_image_dir  # for 'llava_v1_5_mix665k.json'
+        with open(os.path.join(DATA_DIR, "{}.json".format(vqa_data))) as f:
+            vqa_dataset = json.load(f)
+        self.vqa_dataset = vqa_dataset
+
+        print("vqa_dataset: ", len(self.vqa_dataset))
 
     def __len__(self):
         return self.samples_per_epoch
@@ -92,27 +96,26 @@ class VQADataset(torch.utils.data.Dataset):
         return x
 
     def __getitem__(self, idx):
-        idx = random.randint(0, len(self.vqa_data) - 1)
-        item = self.vqa_data[idx]
+        idx = random.randint(0, len(self.vqa_dataset) - 1)
+        item = self.vqa_dataset[idx]
         image_path = item.get("image", "")
         _text_only = False  # _text_only == True, when item['image'] is not there
         if image_path:
-            image_path = os.path.join(self.vqa_image_root, os.path.basename(item["image"]))
+            if self.vqa_data == "llava_instruct_150k":
+                image_path = os.path.join(self.vqa_image_root, os.path.basename(item["image"]))
+            elif self.vqa_data == "llava_v1_5_mix665k":
+                image_path = os.path.join(self.vqa_image_root, item["image"])
             image = cv2.imread(image_path)
         else:
             _text_only = True
             image = None
 
         if image is None:
-            # handle the error, e.g., skip this sample or load a default image
+            # skip this sample or load a default image
             image = np.zeros((1024, 1024, 3), dtype=np.uint8)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         ori_size = image.shape[:2]
-        image_clip = self.clip_image_processor.preprocess(image, return_tensors="pt")[
-            "pixel_values"
-        ][
-            0
-        ]  # preprocess image for clip
+        image_clip = self.clip_image_processor.preprocess(image, return_tensors="pt")["pixel_values"][0]  # preprocess image for clip
 
         image = self.transform.apply_image(image)  # preprocess image for sam
         resize = image.shape[:2]

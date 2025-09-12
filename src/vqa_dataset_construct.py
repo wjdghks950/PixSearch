@@ -195,7 +195,10 @@ def build_in_context_cache(
                 for sample in incontext_samples:
                     if not sample["content"][-1]["image_url"]["url"].startswith("data:"):
                         img_path = sample["content"][-1]["image_url"]["url"]
-                        pil_img = image_to_pil(img_path) if not resize_img else resize_keep_aspect(image_to_pil(img_path))
+                        try:
+                            pil_img = image_to_pil(img_path) if not resize_img else resize_keep_aspect(image_to_pil(img_path))
+                        except AttributeError:
+                            breakpoint()
                         img = image_to_base64(pil_img, with_data_uri=True)
                         sample["content"][-1]["image_url"]["url"] = img
                 return incontext_samples
@@ -594,7 +597,7 @@ def process_sample(args,
             qdecomp_rationale = qdecomp_json["reasoning"]
             qdecomp_subquestions = qdecomp_json["subquestions"]
         except Exception:
-            print("DEBUG: qdecomp_json - ", qdecomp_retrieval)
+            print("DEBUG: qdecomp_json")
             breakpoint()
 
         # Construct incontext_samples for answer_draft since we need to include the qdecomp_json outputs as well
@@ -868,6 +871,7 @@ def interleave_search_and_query(
     """
 
     # NOTE: Run `calculate_dataset_stats.py` to get the question type statistics first from the `{name}_search_annotated_v1.jsonl` files
+
     assert len(instances) == len(question_type_stat), (
         f"The length of instance and question_type_stat must be equal. "
         f"{len(instances)} != {len(question_type_stat)}"
@@ -1213,7 +1217,7 @@ def parse_args(args: list[str] = None, config_str: str = None):
     )
     parser.add_argument(
         "--output_dir",
-        default="/home/jeonghkim/projects/region-mm-retrieve/data/",
+        default="/home/jeonghkim/projects/pixar/data/",
         help="Dataset output directory",
     )
     parser.add_argument("--dataset_name", default="region_rag_vqa", type=str)
@@ -1397,6 +1401,10 @@ def main(args: list[str] = None, config_str: str = None):
                     continue
                 buffer.append(rec)
                 f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+
+        ########
+        continue  # TODO: Run `calculate_dataset_stats.py` to get the question type statistics first from the `{name}_search_annotated_v1.jsonl` files
+        ########
 
         # based on the constructed data and question type stats, interleave `<search> search_query </search>`` tokens
         # if the question type is not in ["Factoid / KB Questions", "Multi-hop External Knowledge Reasoning", "Fine-grained Entity-Identification"]

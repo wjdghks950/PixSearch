@@ -87,7 +87,7 @@ def classify_question(
 # ────────────────────────────────────────────────────────────────────────────
 def iter_dataset_files(data_root: Path) -> List[Path]:
     """
-    Hard‑coded list of six dataset sub‑folders expected under data_root.
+    Hard-coded list of six dataset sub-folders expected under data_root.
     Adjust or extend as needed.
     """
     pattern = "{name}/{name}_search_annotated_v1.jsonl"
@@ -135,9 +135,9 @@ def save_pie(counter: Counter, title: str, fig_dir: Path) -> None:
 # ────────────────────────────────────────────────────────────────────────────
 def main() -> None:
     parser = argparse.ArgumentParser(description="Classify VQA questions into 10 categories.")
-    parser.add_argument("--data_root", default="/home/jeonghkim/projects/region-mm-retrieve/data/region_rag_vqa", type=Path, help="Root folder containing dataset sub‑dirs")
-    parser.add_argument("--out_json", default="/home/jeonghkim/projects/region-mm-retrieve/data/region_rag_vqa/question_types.json", type=Path, help="Path to write/read cached classification JSON")
-    parser.add_argument("--fig_dir", default="/home/jeonghkim/projects/region-mm-retrieve/plots", type=Path, help="Directory to save pie charts")
+    parser.add_argument("--data_root", default="/home/jeonghkim/projects/pixar/data/region_rag_vqa", type=Path, help="Root folder containing dataset sub‑dirs")
+    parser.add_argument("--out_json", default="/home/jeonghkim/projects/pixar/data/region_rag_vqa/question_types.json", type=Path, help="Path to write/read cached classification JSON")
+    parser.add_argument("--fig_dir", default="/home/jeonghkim/projects/pixar/plots", type=Path, help="Directory to save pie charts")
     parser.add_argument("--model", default="gpt-4.1-mini")
     parser.add_argument("--temperature", type=float, default=0.0)
     args = parser.parse_args()

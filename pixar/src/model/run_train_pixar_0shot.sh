@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# 'run_train_plum_ft.sh' uses Partonomy dataset to finetune the models
+# ./run_train_pixar_0shot.sh 13B 0.1 8 2 false true 6 bf16 0,1,2,3,4,5,6,7 0.7 0.3
 
-# fnd a random free port
+# find a random free port
 FREE_PORT=$(python -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
 
 # 1) Model size
@@ -67,8 +67,6 @@ if [ -z "$9" ]; then
 else
     gpu_ids=$9
 fi
-
-# --- NEW: FOCAL_ALPHA and FOCAL_BETA as command-line or prompted input ---
 
 if [ "$dice_type" == "true" ]; then
     DICE_TYPE="focal_tversky"
@@ -137,6 +135,7 @@ deepspeed --include localhost:${gpu_ids} --master_port=${FREE_PORT} pixar_train_
     --version=$LLAVA_MODEL_PATH \
     --dataset_dir=$DATASET_DIR \
     --vision_pretrained=$VISION_MODEL_PATH \
+    --vision-tower=$VISION_TOWER \
     --dataset="sem_seg||refer_seg||vqa||reason_seg" \
     --val_dataset="ade20k|validation" \
     --vqa_data="llava_v1_5_mix665k" \

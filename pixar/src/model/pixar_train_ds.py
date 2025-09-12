@@ -29,6 +29,8 @@ except ImportError:
     def GatheredParameters(params, modifier_rank=None):
         yield
 
+from deepspeed.runtime.zero.utils import ZeRORuntimeException
+
 from model.PIXAR import PIXARForCausalLM
 from model.llava import conversation as conversation_lib
 from utils.dataset import HybridDataset, ValDataset, collate_fn
@@ -227,6 +229,26 @@ def main(args):
     print(">> (train) run_name: ", run_name)
     print(">> (train) run_ckpt_path: ", run_ckpt_path)
 
+    os.makedirs(args.log_dir, exist_ok=True)
+    metrics_path = os.path.join(args.log_dir, f"{run_name}.json")
+
+    # compute latest_epoch on ALL ranks
+    epoch_metrics = {}
+    latest_epoch = 0
+    if os.path.exists(metrics_path):
+        try:
+            with open(metrics_path, "r") as f:
+                epoch_metrics = json.load(f)
+            # keys are strings; convert to int
+            if len(epoch_metrics) > 0:
+                latest_epoch = max(map(int, epoch_metrics.keys()))
+        except Exception as e:
+            print(f"[warn] Could not read metrics file {metrics_path}: {e}. Starting from epoch 0.")
+            latest_epoch = 0
+
+    # only rank 0 sets up writer + wandb
+    writer = None
+
     if args.local_rank == 0:
         os.makedirs(args.log_dir, exist_ok=True)
         writer = SummaryWriter(args.log_dir)
@@ -261,14 +283,6 @@ def main(args):
             name=run_name,
             config=config_for_wandb # Use the sanitized config
         )
-
-        epoch_metrics = {}  # dict to save metric outputs
-        metrics_path = os.path.join(args.log_dir, f"{run_name}.json")
-        latest_epoch = 0
-        if os.path.exists(metrics_path):
-            with open(metrics_path, "r") as f:
-                epoch_metrics = json.load(f)
-                latest_epoch = max(map(int, list(epoch_metrics.keys())))
     else:
         writer = None
 
@@ -486,6 +500,7 @@ def main(args):
                 "lr": args.lr,
                 "weight_decay": 0.0,
                 "betas": (args.beta1, args.beta2),
+                "torch_adam": True,
             },
         },
         "scheduler": {
@@ -560,7 +575,7 @@ def main(args):
 
     # resume deepspeed checkpoint or 0-shot checkpoints for Partonomy fine-tuning
     if (args.auto_resume and len(args.resume) == 0) or args.zero_shot_ckpt_path:
-        if args.zero_shot_ckpt_path and args.explanatory_seg_data:
+        if args.zero_shot_ckpt_path:
             resume = args.zero_shot_ckpt_path
             print(">> (train) Train on Partonomy dataset from: ", resume)
             print(">> (train) resume exists: ", os.path.exists(resume))
@@ -587,11 +602,25 @@ def main(args):
             load_lr_scheduler_states = True
             load_optimizer_states = True
 
-        load_path, client_state = model_engine.load_checkpoint(
-                                        args.resume, load_module_strict=False,
-                                        load_optimizer_states=load_optimizer_states,
-                                        load_lr_scheduler_states=load_lr_scheduler_states
-                                    )
+        try:
+            load_path, client_state = model_engine.load_checkpoint(
+                args.resume, load_module_strict=False,
+                load_optimizer_states=load_optimizer_states,
+                load_lr_scheduler_states=load_lr_scheduler_states
+            )
+        except ZeRORuntimeException as e:
+            msg = str(e)
+            if "DP world size" in msg:
+                if args.local_rank == 0:
+                    print("[warning] ZeRO optimizer state partition DP mismatch detected.")
+                    print("[warning] Re-trying by loading *model weights only* (no optimizer/scheduler).")
+                load_path, client_state = model_engine.load_checkpoint(
+                    args.resume, load_module_strict=False,
+                    load_optimizer_states=False,
+                    load_lr_scheduler_states=False
+                )
+            else:
+                raise
 
         scheduler = model_engine.lr_scheduler
         if args.zero_shot_ckpt_path and args.explanatory_seg_data:

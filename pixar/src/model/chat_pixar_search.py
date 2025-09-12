@@ -207,8 +207,6 @@ def generate_with_tools(
         if new_tok == eos_id:
             break
 
-        breakpoint()
-
         # check for closed <search> ... </search> in tail
         tail_txt = _decode_tail(tokenizer, generated, k=512)
         payload = _extract_closed_payload(tail_txt, SEARCH_START_TOKEN, SEARCH_END_TOKEN)
@@ -286,7 +284,7 @@ def generate_with_tools(
             # textual query
             input_query = payload_text
 
-        # 7) Call the search tool
+        # search tool call
         try:
             results = search_pipeline(input_query, k=search_k)
         except Exception as e:
