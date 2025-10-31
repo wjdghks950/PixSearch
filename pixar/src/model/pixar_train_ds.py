@@ -31,7 +31,8 @@ except ImportError:
 
 from deepspeed.runtime.zero.utils import ZeRORuntimeException
 
-from model.PIXAR import PIXARForCausalLM
+# from model.PIXAR import PIXARForCausalLM
+from model.PIXAR_llama3_2_11b import PIXARForCausalLM
 from model.llava import conversation as conversation_lib
 from utils.dataset import HybridDataset, ValDataset, collate_fn
 
@@ -139,6 +140,8 @@ def parse_args(args):
     parser.add_argument("--focal_tversky_beta", default=0.3, type=float)
     parser.add_argument("--limit_batches", default=None, type=int)
     parser.add_argument("--use_feedback_loop", action="store_true", default=False)
+    parser.add_argument("--info_mask_type", default="pad", type=str, help="['pad', 'attn'] for masking <information> token payloads")
+    parser.add_argument("--use_llama3_vision_backbone", action="store_true", default=False)
 
     # bidirectionalencoderblock params
     parser.add_argument("--bidir_nhead", default=8, type=int)
@@ -169,7 +172,7 @@ def parse_args(args):
         "--conv_type",
         default="llava_v1",
         type=str,
-        choices=["llava_v1", "llava_llama_2"],
+        choices=["llava_v1", "llava_llama_2", "pixar_0shot_v1"],
     )
 
     parser.add_argument("--debug", action="store_true", default=False)
@@ -182,6 +185,12 @@ def parse_args(args):
 def main(args):
     args, parser = parse_args(args)
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
+
+    # prevent cuDNN fails from appearing
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     # set up run_name and run_ckpt_path
     run_name = (f"{args.exp_name}_maxlen{args.model_max_length}"
@@ -221,6 +230,10 @@ def main(args):
     if args.pixar_data:
         run_name += f"_pixar_{'_'.join(args.pixar_data.split('||'))}"
         run_ckpt_path += f"_pixar_{'_'.join(args.pixar_data.split('||'))}"
+    if args.use_llama3_vision_backbone:
+        print(f">> Using Llama-3.2-11B Vision Backbone >>")
+        run_name += f"_llama3_2_11b"
+        run_ckpt_path += f"_llama3_2_11b"
 
     sample_rates = args.sample_rates.split(",")
     run_name += f"_srates_{'_'.join(sample_rates)}"
@@ -293,6 +306,7 @@ def main(args):
         model_max_length=args.model_max_length,
         padding_side="right",
         use_fast=True,
+        legacy=False,  # NOTE: non-legacy token handling
     )
     tokenizer.pad_token = tokenizer.unk_token
 
@@ -324,6 +338,7 @@ def main(args):
         "focal_tversky_beta": args.focal_tversky_beta,
         "bidir_nhead": args.bidir_nhead,
         "bidir_dim_feedforward": args.bidir_dim_feedforward,
+        "use_llama3_vision_backbone": args.use_llama3_vision_backbone,
     }
     torch_dtype = torch.float32
     if args.precision == "bf16":
@@ -502,7 +517,6 @@ def main(args):
                 "betas": (args.beta1, args.beta2),
                 "torch_adam": True,
             },
-            "torch_adam": True,
         },
         "scheduler": {
             "type": "WarmupDecayLR",
@@ -526,13 +540,10 @@ def main(args):
             "contiguous_gradients": True,
             "overlap_comm": True,
             "reduce_scatter": True,
-            "reduce_bucket_size": 5e8,
-            "allgather_bucket_size": 5e8,
+            "reduce_bucket_size": 2e8,  # 5e8
+            "allgather_bucket_size": 2e8,  # 5e8
             "ignore_unused_parameters": True
         },
-        "ddp": {
-            "find_unused_parameters": True
-        }
     }
 
     # # TODO: Unit test the collate_fn with HybridDataset - delete this block after testing  ####
@@ -552,6 +563,8 @@ def main(args):
             conv_type=args.conv_type,
             use_mm_start_end=args.use_mm_start_end,
             local_rank=args.local_rank,
+            model_max_length=args.model_max_length,
+            info_mask_type=args.info_mask_type
         ),
         config=ds_config,
     )
@@ -596,7 +609,7 @@ def main(args):
         print(">> (train) Loading checkpoint from: ", ckpt_dir)
         print(">> list dir of ckpt_dir: ", os.listdir(os.path.join(args.resume, ckpt_dir)))
         # load model checkpoint
-        if args.zero_shot_ckpt_path and args.explanatory_seg_data:
+        if args.zero_shot_ckpt_path:
             load_lr_scheduler_states = False
             load_optimizer_states = False
         else:
@@ -622,9 +635,11 @@ def main(args):
                 )
             else:
                 raise
+        if hasattr(model_engine, "module") and hasattr(model_engine.module, "_enforce_sam_fp32"):
+            model_engine.module._enforce_sam_fp32()  # recast SAM to fp32 post-load
 
         scheduler = model_engine.lr_scheduler
-        if args.zero_shot_ckpt_path and args.explanatory_seg_data:
+        if args.zero_shot_ckpt_path:
             args.start_epoch = latest_epoch
         else:
             # args.start_epoch = (int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch) + latest_epoch
@@ -806,6 +821,16 @@ def train(
                 input_dict["images"] = input_dict["images"].float()
                 input_dict["images_clip"] = input_dict["images_clip"].float()
 
+            # NOTE: Temporary sequence clamping to prevent any more model max length exceeds
+            L = args.model_max_length
+            for k in ("input_ids","labels","attention_masks","per_token_labels"):
+                if k in input_dict and input_dict[k].dim() == 2 and input_dict[k].size(1) > L:
+                    input_dict[k] = input_dict[k][:, :L].contiguous()
+            if "mask_positions_in_input_ids" in input_dict:
+                input_dict["mask_positions_in_input_ids"] = [
+                    [p for p in pos_list if p < L] for pos_list in input_dict["mask_positions_in_input_ids"]
+                ]
+
             output_dict = model(**input_dict)
 
             loss = output_dict["loss"]
@@ -833,11 +858,7 @@ def train(
             mask_losses.update(mask_loss.item(), input_dict["images"].size(0))
             model.backward(loss)
 
-            if args.zero_shot_ckpt_path and args.explanatory_seg_data:
-                model.step()
-
-        if not (args.zero_shot_ckpt_path and args.explanatory_seg_data):
-            model.step()  # during 0-shot training, we take model.step() every args.gradient_accumulation_steps for additional gradient accumulation
+        model.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)

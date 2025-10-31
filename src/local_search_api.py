@@ -319,6 +319,11 @@ class SearchEngine:
         elif self.model_type == "dinov3":
             pil_images = []
             for p in image_paths:
+                image_file_exts = ["jpg", "png", "jpeg", "JPEG", "JPG", "PNG", "webp"]  # prevent oven/infoseek image paths from causing err
+                if not p.endswith(tuple(image_file_exts)):
+                    p = [f"{p}.{ext}" for ext in image_file_exts if os.path.exists(f"{p}.{ext}")][0]
+                #     print(f"** >> (ext) path: {p}")
+                # print(f"** >> path: {p}")
                 with Image.open(p) as im:
                     pil_images.append(im.convert("RGB"))
             inputs = self.image_processor(images=pil_images, return_tensors="pt").to(self.device)

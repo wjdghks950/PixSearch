@@ -1,7 +1,13 @@
 #!/bin/bash
 
+# ./run_train_pixar_ft.sh 13B 0.1 8 2 false true 8 bf16 5 0.7 0.3
+
 # Find a random free port
 FREE_PORT=$(python -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
+export NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_BLOCKING_WAIT=1
+export NCCL_TIMEOUT=1800
+export NCCL_IB_DISABLE=1
 
 # 'run_train_pixar_ft.sh' uses Pixar dataset to finetune the models
 
@@ -134,7 +140,7 @@ ZERO_SHOT_CKPT_PATH="runs/plum-13b_kld_0.1_focal_tversky_8_v1_0shot_w_reasonseg/
 # # [Focal Tversky - No Feedback Loop]
 # ZERO_SHOT_CKPT_PATH="runs/plum-13b_kld_0.1_focal_tversky_8_v1_0shot_w_reasonseg/plum-13b_kld_0.1_focal_tversky_8_v1_0shot_w_reasonseg_bidirbio_2048_maxlen512_epochs25_bidir_bio_train_prompt_enc_srates_9_5_5_1_ckpt_model"
 
-EXP_NAME="pixar-${model_size}_kld_${kld_loss_weight}_${DICE_TYPE}_${dice_loss_weight}_pixar_ft"
+EXP_NAME="pixar-${model_size}_kld_${kld_loss_weight}_${DICE_TYPE}_${dice_loss_weight}_pixar_ft_info_tok_padmask_lr_3e-4_gt_interleaved"
 # EVAL_CKPT_PATH="runs/plum-13b_kld_0.1_focal_tversky_8_v1_0shot/plum-13b_kld_0.1_focal_tversky_8_v1_0shot_bidirbio_2048_accum_10_maxlen512_epochs25_segloss_2_bce_loss_2_kld_loss_0_dice_loss_8_bidir_bio_train_prompt_enc_ckpt_model"
 
 echo "Running experiment: $EXP_NAME"
@@ -153,10 +159,10 @@ deepspeed --include localhost:${gpu_ids} --master_port=${FREE_PORT} pixar_train_
     --vision_pretrained=$VISION_MODEL_PATH \
     --vision-tower=$VISION_TOWER \
     --zero_shot_ckpt_path=$ZERO_SHOT_CKPT_PATH \
-    --dataset="pixar" \
-    --pixar_data="oven||infoseek||aokvqa||okvqa||textvqa||webqa" \
+    --dataset="sem_seg||refer_seg||vqa||reason_seg||pixar" \
+    --pixar_data="oven||infoseek||aokvqa||okvqa||textvqa" \
     --random_seed=42 \
-    --sample_rates="2,1,1,2,1,1" \
+    --sample_rates="3,3,5,1,9" \
     --batch_size=$BATCH_SIZE \
     --grad_accumulation_steps 10 \
     --ce_loss_weight=1.0 \
@@ -170,7 +176,7 @@ deepspeed --include localhost:${gpu_ids} --master_port=${FREE_PORT} pixar_train_
     --precision=$precision \
     --model_max_length 512 \
     --dice_scale_factor 1000.0 \
-    --epochs 3 \
+    --epochs 20 \
     --train_mask_prompt_encoder \
     --focal_tversky_alpha=$FOCAL_ALPHA \
     --focal_tversky_beta=$FOCAL_BETA \
@@ -178,19 +184,9 @@ deepspeed --include localhost:${gpu_ids} --master_port=${FREE_PORT} pixar_train_
     --bidir_dim_feedforward 2048 \
     --lr 3e-4 \
     --use_feedback_loop \
+    --info_mask_type="pad" \
     --auto_resume
+    # --conv_type pixar_0shot_v1
 
-
-    # --dataset="pixar" \
-    # --use_feedback_loop \
-    # --eval_ckpt_path=$EVAL_CKPT_PATH \
-    # --limit_batches 200 \
-    # --use_hinge_loss \
-    # --bidir_dim_feedforward 2048 OR 768
-    # --pred_binary_span \
-    # --use_crf_bio \
-    # --explanatory_seg_data \
-    # --use_cross_attn_bio \
-    # --use_bidir_bio \
-    # --grad_accumulation_steps 20 \
-    # --lr 2e-5 \
+# --lr 3e-4  # original lr
+# --pixar_data="oven||infoseek||aokvqa||okvqa||textvqa||webqa" \

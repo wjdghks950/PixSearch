@@ -86,7 +86,9 @@ class PixarDataset(torch.utils.data.Dataset):
 
         self.samples: List[Dict[str, Any]] = []
         for ds in self.pixar_data:
-            with open(os.path.join(self.base_image_dir, ds, f"{ds}_retrieve_k_5_interleaved_{self.jsonl_version}.jsonl"), "r") as reader:
+            # json_path = f"{ds}_retrieve_k_5_interleaved_{self.jsonl_version}.jsonl"  # v0
+            json_path = f"{ds}_retrieve_k_5_gt_interleaved_{self.jsonl_version}.jsonl"  # v1 with gt interleaved in <information> </information>
+            with open(os.path.join(self.base_image_dir, ds, json_path), "r") as reader:
                 for line in reader:
                     line = line.strip()
                     if not line:
@@ -116,7 +118,11 @@ class PixarDataset(torch.utils.data.Dataset):
         image_path = os.path.join(self.base_image_dir, image_path_suffix)
         image_file_exts = ["jpg", "png", "jpeg", "JPEG", "JPG", "PNG", "webp"]
         if not image_path.endswith(tuple(image_file_exts)):
-            image_path = [f"{image_path}.{ext}" for ext in image_file_exts if os.path.exists(f"{image_path}.{ext}")][0]
+            try:
+                image_path = [f"{image_path}.{ext}" for ext in image_file_exts if os.path.exists(f"{image_path}.{ext}")][0]
+            except Exception as e:
+                print(f"image_path: {image_path}")
+                breakpoint()
 
         question = s.get("question", "")
         decomposed_questions = s.get("decomposed_questions", None)

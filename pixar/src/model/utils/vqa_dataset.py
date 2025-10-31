@@ -1,5 +1,6 @@
 import json
 import os
+import glob
 import random
 import numpy as np
 import cv2
@@ -665,4 +666,287 @@ class CragMMDataset(torch.utils.data.Dataset):
             search_calls_norm,
             inference,
             'cragmm'
+        )
+
+
+class InfoseekDataset(torch.utils.data.Dataset):
+    pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
+    pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
+    img_size = 1024
+    ignore_label = 255
+
+    def __init__(
+        self,
+        base_image_dir,
+        tokenizer,
+        vision_tower,
+        split_file: str = "infoseek_val.jsonl",
+        image_size: int = 1024,
+        use_mm_start_end: bool = False,
+    ):
+        self.base_image_dir = base_image_dir
+        self.tokenizer = tokenizer
+        self.vision_tower = vision_tower
+        self.use_mm_start_end = use_mm_start_end
+
+        self.image_size = image_size
+        self.transform = ResizeLongestSide(image_size)
+        self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
+
+        self.root = os.path.join(base_image_dir, "infoseek")
+        # self.image_root = os.path.join(self.root, "images")  # "/home/jeonghkim/projects/pixar/data/infoseek/images"
+        self.image_root = os.path.join("/home/jeonghkim/projects/pixar/data/infoseek", "images")
+        split_path = os.path.join(self.root, split_file)
+        if not os.path.exists(split_path):
+            raise FileNotFoundError(f"[InfoseekDataset] split file not found: {split_path}")
+
+        # load jsonl
+        self.rows = []
+        with open(split_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    self.rows.append(json.loads(line))
+
+        print(f"InfoSeek ({os.path.basename(split_path)}): {len(self.rows)}")
+
+    def __len__(self):
+        return len(self.rows)
+
+    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        x = (x - self.pixel_mean) / self.pixel_std
+        h, w = x.shape[-2:]
+        padh = self.img_size - h
+        padw = self.img_size - w
+        x = F.pad(x, (0, padw, 0, padh))
+        return x
+
+    @staticmethod
+    def _find_image(image_root: str, image_id: str):
+        for ext in (".jpg", ".jpeg", ".png", ".webp"):
+            p = os.path.join(image_root, f"{image_id}{ext}")
+            if os.path.exists(p):
+                return p
+        candidates = []
+        stem_glob = os.path.join(image_root, f"{image_id}.*")
+        candidates.extend(sorted(glob.glob(stem_glob)))
+        return candidates[0] if candidates else None
+
+    def __getitem__(self, idx: int):
+        item = self.rows[idx]
+
+        image_id = item.get("image_id", "")
+        question = item.get("question", "")
+
+        # Normalize answer field to list[str]
+        raw_ans = item.get("answer", [])
+        if isinstance(raw_ans, str):
+            sampled_answer_choices = [raw_ans]
+        elif isinstance(raw_ans, list):
+            sampled_answer_choices = raw_ans
+        else:
+            sampled_answer_choices = [str(raw_ans)]
+
+        # load image
+        image_path = self._find_image(self.image_root, image_id)
+        if image_path is None:
+            image_rgb = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
+            image_path = ""
+        else:
+            image_bgr = cv2.imread(image_path)
+            if image_bgr is None:
+                image_rgb = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
+                image_path = ""
+            else:
+                image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+        ori_size = image_rgb.shape[:2]
+        image_clip = self.clip_image_processor.preprocess(image_rgb, return_tensors="pt")["pixel_values"][0]
+
+        image_resized = self.transform.apply_image(image_rgb)
+        resize = image_resized.shape[:2]
+        image = torch.from_numpy(image_resized).permute(2, 0, 1).contiguous().float()
+        image = self.preprocess(image)
+
+        conv = conversation_lib.default_conversation.copy()
+        mm_use = conv.sep_style == conversation_lib.SeparatorStyle.TWO if self.use_mm_start_end else False
+        source = preprocess_multimodal(
+            question,
+            mm_use_im_start_end=mm_use,
+            is_textvqa=True
+        )
+        conv.messages = []
+        role = conv.roles[0]
+        # instruction = 'Answer the question using a single word or phrase.'
+        # conv.append_message(role, source + ' ' + instruction)
+        conv.append_message(role, source)
+        conversations = [conv.get_prompt()]
+
+        questions = conversations
+
+        # No masks for VQA eval
+        masks = torch.rand(0, *ori_size)
+        label = torch.ones(ori_size) * self.ignore_label
+        per_token_label_dict = [{}]
+        search_calls_norm = []
+        inference = True
+
+        return (
+            image_path,
+            image,
+            image_clip,
+            conversations,
+            masks,
+            label,
+            resize,
+            questions,
+            sampled_answer_choices,
+            per_token_label_dict,
+            search_calls_norm,
+            inference,
+            "infoseek",
+        )
+
+
+class OvenDataset(torch.utils.data.Dataset):
+    pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
+    pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
+    img_size = 1024
+    ignore_label = 255
+
+    def __init__(
+        self,
+        base_image_dir,
+        tokenizer,
+        vision_tower,
+        mode: str = "entity",  # "entity", "query"
+        split: str = "val",
+        image_size: int = 1024,
+        use_mm_start_end: bool = False,
+    ):
+        self.base_image_dir = base_image_dir
+        self.tokenizer = tokenizer
+        self.vision_tower = vision_tower
+        self.mode = mode.lower()
+        assert self.mode in ("entity", "query"), "mode must be 'entity' or 'query'"
+        self.split = split
+        self.use_mm_start_end = use_mm_start_end
+
+        self.image_size = image_size
+        self.transform = ResizeLongestSide(image_size)
+        self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
+
+        self.root = os.path.join(base_image_dir, "oven")
+        # self.image_root = os.path.join(self.root, "images")  # "/home/jeonghkim/projects/pixar/data/infoseek/images"
+        self.image_root = os.path.join("/home/jeonghkim/projects/pixar/data/infoseek", "images")
+
+        fname = f"oven_{'entity' if self.mode=='entity' else 'query'}_{split}.jsonl"
+        split_path = os.path.join(self.root, fname)
+        if not os.path.exists(split_path):
+            raise FileNotFoundError(f"[OvenDataset] split file not found: {split_path}")
+
+        self.rows = []
+        with open(split_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    self.rows.append(json.loads(line))
+
+        print(f"OVEN ({self.mode}, {split}): {len(self.rows)}")
+
+    def __len__(self):
+        return len(self.rows)
+
+    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        x = (x - self.pixel_mean) / self.pixel_std
+        h, w = x.shape[-2:]
+        padh = self.img_size - h
+        padw = self.img_size - w
+        x = F.pad(x, (0, padw, 0, padh))
+        return x
+
+    @staticmethod
+    def _find_image(image_root: str, image_id: str):
+        for ext in (".jpg", ".jpeg", ".png", ".webp"):
+            p = os.path.join(image_root, f"{image_id}{ext}")
+            if os.path.exists(p):
+                return p
+        candidates = sorted(glob.glob(os.path.join(image_root, f"{image_id}.*")))
+        return candidates[0] if candidates else None
+
+    def __getitem__(self, idx: int):
+        item = self.rows[idx]
+
+        image_id = item.get("image_id", "")
+        question = item.get("question", "")
+
+        if self.mode == "entity":
+            gt = item.get("entity_text", "")
+            sampled_answer_choices = [gt] if isinstance(gt, str) else [str(gt)]
+        else:
+            raw_ans = item.get("answer", [])
+            if isinstance(raw_ans, str):
+                sampled_answer_choices = [raw_ans]
+            elif isinstance(raw_ans, list):
+                sampled_answer_choices = raw_ans
+            else:
+                sampled_answer_choices = [str(raw_ans)]
+
+        # load images
+        image_path = self._find_image(self.image_root, image_id)
+        if image_path is None:
+            image_rgb = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
+            image_path = ""
+        else:
+            image_bgr = cv2.imread(image_path)
+            if image_bgr is None:
+                image_rgb = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
+                image_path = ""
+            else:
+                image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+        ori_size = image_rgb.shape[:2]
+        image_clip = self.clip_image_processor.preprocess(image_rgb, return_tensors="pt")["pixel_values"][0]
+
+        image_resized = self.transform.apply_image(image_rgb)
+        resize = image_resized.shape[:2]
+        image = torch.from_numpy(image_resized).permute(2, 0, 1).contiguous().float()
+        image = self.preprocess(image)
+
+        conv = conversation_lib.default_conversation.copy()
+        mm_use = conv.sep_style == conversation_lib.SeparatorStyle.TWO if self.use_mm_start_end else False
+        source = preprocess_multimodal(
+            question,
+            mm_use_im_start_end=mm_use,
+            is_textvqa=True
+        )
+        conv.messages = []
+        role = conv.roles[0]
+        instruction = 'Answer the question using a single word or phrase.'
+        conv.append_message(role, source + ' ' + instruction)
+        conversations = [conv.get_prompt()]
+
+        questions = conversations
+
+        # no masks for oven
+        masks = torch.rand(0, *ori_size)
+        label = torch.ones(ori_size) * self.ignore_label
+        per_token_label_dict = [{}]
+        search_calls_norm = []
+        inference = True
+
+        return (
+            image_path,
+            image,
+            image_clip,
+            conversations,
+            masks,
+            label,
+            resize,
+            questions,
+            sampled_answer_choices,
+            per_token_label_dict,
+            search_calls_norm,
+            inference,
+            f"oven_{self.mode}",
         )

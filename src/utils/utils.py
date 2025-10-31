@@ -37,19 +37,19 @@ os.environ["NO_PROXY"] = ",".join([
 ])
 
 DATASETS = {
-    "aokvqa":  {"hf_name": "HuggingFaceM4/A-OKVQA", "split": "train"},
-    "okvqa":   {"hf_name": "HuggingFaceM4/OK-VQA",   "split": "train"},
-    "webqa":   {"hf_name": "TreezzZ/WebQA",       "split": "train"},
-    "textvqa": {"hf_name": "lmms-lab/textvqa", "split": "train"},
-    "infoseek": {"hf_name": "ychenNLP/oven", "split": "train"},
-    "oven": {"hf_name": "ychenNLP/oven", "split": "train"},
+    "cragmm": {"hf_name": "crag-mm-2025/crag-mm-single-turn-public", "split": "validation"},
+    # "aokvqa":  {"hf_name": "HuggingFaceM4/A-OKVQA", "split": "train"},
+    # "okvqa":   {"hf_name": "HuggingFaceM4/OK-VQA",   "split": "train"},
+    # "webqa":   {"hf_name": "TreezzZ/WebQA",       "split": "train"},
+    # "textvqa": {"hf_name": "lmms-lab/textvqa", "split": "train"},
+    # "infoseek": {"hf_name": "ychenNLP/oven", "split": "train"},
+    # "oven": {"hf_name": "ychenNLP/oven", "split": "train"},
     # "vizwiz":  {"hf_name": "HuggingFaceM4/VizWiz", "split": "train"},
     # "encyclopedicvqa": {"hf_name": "", "split": "train"},
     # "visual_genome": {"hf_name": "visual_genome", "split": "train"},
     # "kvqa":    {"hf_name": "AdaptAI/KVQA",          "split": "train"},
     # "pathvqa": {"hf_name": "shapenshap/pathvqa",    "split": "train"},
     # "scienceqa": {"hf_name": "lukaemon/ScienceQA",  "split": "train"},
-    # "cragmm": {"hf_name": "crag-mm-2025/crag-mm-single-turn-public", "split": "validation"}
 }
 
 

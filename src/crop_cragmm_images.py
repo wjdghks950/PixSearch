@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import requests
 
 import logging
 import os
@@ -9,6 +10,7 @@ from functools import partial
 from itertools import chain, islice
 from pathlib import Path
 from typing import List, Tuple, Optional, Union, Any
+from urllib.parse import urlparse
 
 import coloredlogs
 
@@ -60,6 +62,20 @@ def _encode_image_base64(image_input) -> str:
     """
     if isinstance(image_input, str):
         # Handle file path
+        if image_input.startswith("http"):
+            try:
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (compatible; ImageDownloader/1.0; +https://github.com/your-repo)"
+                }
+                response = requests.get(image_input, headers=headers, stream=True, timeout=15)
+                response.raise_for_status()
+                image_input = Image.open(io.BytesIO(response.content)).convert("RGB")
+                buffer = io.BytesIO()
+                image_input.save(buffer, format="JPEG")
+                return base64.b64encode(buffer.getvalue()).decode()
+            except Exception as e:
+                breakpoint()
+                raise FileNotFoundError(f"Failed to download image from {image_input}: {e}")
         with open(image_input, "rb") as f:
             return base64.b64encode(f.read()).decode()
     elif isinstance(image_input, Image.Image):
@@ -153,7 +169,19 @@ def load_grounding_dino(config_path: str, ckpt_path: str, device: str = "cuda"):
 
 def load_image_for_groundingdino(image_input) -> Tuple[np.array, torch.Tensor]:
     if isinstance(image_input, str):
-        image_source = Image.open(image_input).convert("RGB")
+        if image_input.startswith("http"):
+            try:
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (compatible; ImageDownloader/1.0; +https://github.com/your-repo)"
+                }
+                response = requests.get(image_input, headers=headers, stream=True, timeout=15)
+                response.raise_for_status()
+                image_source = Image.open(io.BytesIO(response.content)).convert("RGB")
+            except Exception as e:
+                breakpoint()
+                raise FileNotFoundError(f"Failed to download image from {image_input}: {e}")
+        else:
+            image_source = Image.open(image_input).convert("RGB")
     elif isinstance(image_input, Image.Image):
         if image_input.mode != "RGB":  # ensure 3-channel RGB mode
             image_source = image_input.convert("RGB")

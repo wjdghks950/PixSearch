@@ -1,5 +1,3 @@
-# NOTE: This is a legacy code from PLUM that is not used in the current codebase - only as a reference
-
 import json
 import os
 import sys

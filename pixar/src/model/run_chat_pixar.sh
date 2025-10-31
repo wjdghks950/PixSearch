@@ -5,20 +5,21 @@ else
     gpu_ids=$1
 fi
 
-# export PYTHONPATH="/home/jeonghkim/projects/pixar:$PYTHONPATH"
-export PYTHONPATH="/shared/nas2/jk100/PixaR/:$PYTHONPATH"
+export PYTHONPATH="/home/jeonghkim/projects/pixar:$PYTHONPATH"
+# export PYTHONPATH="/shared/nas2/jk100/PixaR/:$PYTHONPATH"
 
-# CKPT_PARENT_PATH=/home/jeonghkim/projects/pixar/pixar/src/model/runs
-CKPT_PARENT_PATH=/shared/nas2/jk100/partonomy_private/src/models/PLUM/runs
+CKPT_PARENT_PATH=/home/jeonghkim/projects/pixar/pixar/src/model/runs
+# CKPT_PARENT_PATH=/shared/nas2/jk100/partonomy_private/src/models/PLUM/runs
 # MODEL_CKPT_PATH=$CKPT_PARENT_PATH/pixar-13b_kld_0.1_focal_tversky_8_pixar_ft/merged_model
-MODEL_CKPT_PATH=$CKPT_PARENT_PATH/plum-13b_kld_0.1_focal_tversky_8_v1_0shot_w_reasonseg/merged_model_9551
+MODEL_CKPT_PATH=$CKPT_PARENT_PATH/pixar-13b_kld_0.1_focal_tversky_8_pixar_ft_v0/merged_model
+# MODEL_CKPT_PATH=$CKPT_PARENT_PATH/plum-13b_kld_0.1_focal_tversky_8_v1_0shot_w_reasonseg/merged_model_9551
 
 CUDA_VISIBLE_DEVICES=${gpu_ids} python chat_pixar_search.py \
 	  --version=$MODEL_CKPT_PATH \
 	  --precision='bf16' \
       --use_bidir_bio \
-      --use_feedback_loop \
-      --conv_type pixar_0shot_v1
+      --use_feedback_loop
+    #   --conv_type pixar_0shot_v1
 
 
 # input text: What parts does the commercial airplane have in common with a military fighter jet?

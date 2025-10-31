@@ -89,18 +89,13 @@ def focal_tversky_loss(
     probs_flat = probs.flatten(1)
     targets_flat = targets.flatten(1)
 
-    #    TP = sum(p*g), FP = sum(p*(1-g)), FN = sum((1-p)*g)
+    # TP = sum(p*g), FP = sum(p*(1-g)), FN = sum((1-p)*g)
     TP = (probs_flat * targets_flat).sum(dim=1)
     FP = (probs_flat * (1 - targets_flat)).sum(dim=1)
     FN = ((1 - probs_flat) * targets_flat).sum(dim=1)
-
-    # 4) Compute the Tversky index for each sample in the batch
     tversky_index = (TP + eps) / (TP + alpha*FN + beta*FP + eps)  # shape: [B]
-
-    # 5) Compute Focal Tversky Loss: (1 - TverskyIndex)^gamma
     focal_tversky = (1.0 - tversky_index) ** gamma  # shape: [B]
 
-    # 6) Average over the batch, then divide by num_masks (like your dice_loss)
     loss = focal_tversky.sum() / (num_masks + 1e-8)
 
     return loss
@@ -461,38 +456,12 @@ class PIXARForCausalLM(LlavaLlamaForCausalLM):
         else:
             self.bio_cross_attn = None
 
-    # def _touch_trainable_modules(self):
-    #     '''
-    #     ensure all trainable submodules participate in the graph every step
-    #     '''
-    #     zero = torch.zeros((), device=next(self.parameters()).device, dtype=torch.float32)
-    #     # mirror your params_to_train list in pixar_train_ds.py
-    #     modules = [
-    #         self.lm_head,
-    #         self.model.text_hidden_fcs,
-    #         self.model.token_to_mask_fcs,
-    #         getattr(self.model.visual_model, "mask_decoder", None),
-    #     ]
-    #     if self.model.config.train_mask_prompt_encoder:
-    #         modules.append(self.model.visual_model.prompt_encoder)
-    #     if getattr(self, "bio_encoder", None) is not None:
-    #         modules.append(self.bio_encoder)
-    #     if getattr(self, "mask_pooler", None) is not None:
-    #         modules.append(self.mask_pooler)
-
-    #     for m in modules:
-    #         if m is None:
-    #             continue
-    #         for p in m.parameters():
-    #             if p.requires_grad:
-    #                 zero = zero + p.float().sum() * 0.0
-    #                 break
-    #     return zero
 
     def _touch_trainable_modules(self) -> torch.Tensor:
         '''
         Ensure every trainable parameter in the relevant submodules participates
-        in the graph each step. This prevents per-rank bucket divergence.
+        in the graph each step. This prevents per-rank bucket divergence leading to
+        WatdogError during multi-gpu training.
         '''
         device = next(self.parameters()).device
         z = torch.zeros((), device=device, dtype=torch.float32)
@@ -521,8 +490,6 @@ class PIXARForCausalLM(LlavaLlamaForCausalLM):
             touch_all_params(self.bio_cross_attn)
 
         return z
-
-
 
     def initialize_teacher_llm(self):
         print(">> (PIXAR.py) Initializing teacher LLM...")
@@ -577,6 +544,7 @@ class PIXARForCausalLM(LlavaLlamaForCausalLM):
         resize_list: List[tuple],  # list of target size for masks
         per_token_labels: torch.LongTensor,  # [# of conv, seq_len] with BIO labels: 0 (O), 1 (B), 2 (I)
         mask_positions_in_input_ids: list,  # list of lists of starting token indices per sample
+        info_masks: torch.LongTensor = None,
         inference: bool = False,
         **kwargs,
     ):
@@ -588,7 +556,7 @@ class PIXARForCausalLM(LlavaLlamaForCausalLM):
             image_embeddings = self.get_visual_embs(images)
         else:
             image_embeddings = None
-        batch_size = (len(offset) - 1)
+        batch_size = image_embeddings.shape[0] if image_embeddings is not None else len(offset) - 1
         assert batch_size == len(offset) - 1
 
         if inference:
@@ -648,8 +616,6 @@ class PIXARForCausalLM(LlavaLlamaForCausalLM):
             ce_loss = outputs.loss  # the lm loss
 
         IMAGE_TOKENS_OFFSET = 255 if has_image_tokens else 0
-        im_start_id = 32000  # XXX tokenizer.convert_tokens_to_ids(DEFAULT_IM_START_TOKEN)
-        im_end_id = 32001  # XXX tokenizer.convert_tokens_to_ids(DEFAULT_IM_END_TOKEN)
         im_start_positions = (input_ids == im_start_id).nonzero(as_tuple=True) if has_image_tokens else (torch.tensor([], device=input_ids.device, dtype=torch.long), torch.tensor([], device=input_ids.device, dtype=torch.long))
         im_end_positions = (input_ids == im_end_id).nonzero(as_tuple=True) if has_image_tokens else (torch.tensor([], device=input_ids.device, dtype=torch.long), torch.tensor([], device=input_ids.device, dtype=torch.long))
         im_start_pos_list = list(zip(im_start_positions[0].tolist(), im_start_positions[1].tolist())) if has_image_tokens else []
@@ -788,6 +754,7 @@ class PIXARForCausalLM(LlavaLlamaForCausalLM):
                             assert token_labels_b[pos].item() == BIO_START_LBL, assert_msg
                         except AssertionError as e:
                             print(e)
+                            breakpoint()
                             raise RuntimeError(f"[PIXAR: model_forward()] BIO-span alignment failed: {e}")
 
                         indices = [pos]
@@ -973,8 +940,6 @@ class PIXARForCausalLM(LlavaLlamaForCausalLM):
         answer_objects = kwargs.pop("answer_objects", None)
         per_token_labels = kwargs.pop("per_token_labels", None)
         mask_positions_in_input_ids = kwargs.pop("mask_positions_in_input_ids", None)
-        # TODO: See what's the difference between this and the model_forward() function
-        # TODO: There is a big performance drop when using this function
 
         '''
         Evaluate the model in inference mode.
@@ -1092,12 +1057,31 @@ class PIXARForCausalLM(LlavaLlamaForCausalLM):
                                 user_span_pos.append((i, i + len(tok_span_ids)))
             else:
                 bio_labels = gt_bio_span
-                # pad bio_labels with 0's to match dim=1 of output_hidden_states
-                bio_labels = torch.cat(
-                    [
-                        torch.zeros((bio_labels.shape[0], IMAGE_TOKENS_OFFSET), device=output_hidden_states.device), bio_labels
-                    ], dim=1
+                base_prefix = input_ids.size(1) + IMAGE_TOKENS_OFFSET
+                left_pad = torch.zeros(
+                    (bio_labels.shape[0], base_prefix),
+                    device=output_hidden_states.device,
+                    dtype=bio_labels.dtype,
                 )
+                bio_labels = torch.cat([left_pad, bio_labels], dim=1)
+
+                # Make length EXACTLY match hidden states length
+                seq_len = output_hidden_states.size(1)
+                cur_len = bio_labels.size(1)
+                if cur_len < seq_len:
+                    bio_labels = torch.cat(
+                        [
+                            bio_labels,
+                            torch.zeros(
+                                (bio_labels.shape[0], seq_len - cur_len),
+                                device=bio_labels.device,
+                                dtype=bio_labels.dtype,
+                            ),
+                        ],
+                        dim=1,
+                    )
+                elif cur_len > seq_len:
+                    bio_labels = bio_labels[:, :seq_len]
 
             # for each sample, extract token spans based on predicted BIO labels.
             def aggregate_bio_spans(

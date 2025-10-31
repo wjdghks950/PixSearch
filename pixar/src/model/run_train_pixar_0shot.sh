@@ -119,6 +119,7 @@ VISION_TOWER=/home/jeonghkim/projects/pixar/hf_cache/clip-vit-large-patch14
 
 # NOTE: "stage1"
 EXP_NAME="pixar-${model_size}_kld_${kld_loss_weight}_${DICE_TYPE}_${dice_loss_weight}_stage1"
+EXP_NAME="plum-13b_kld_0.1_focal_tversky_8_v1_0shot_w_reasonseg"
 
 echo "Running experiment: $EXP_NAME"
 echo " - kld_loss_weight=${kld_loss_weight}"
@@ -138,7 +139,7 @@ deepspeed --include localhost:${gpu_ids} --master_port=${FREE_PORT} pixar_train_
     --vision-tower=$VISION_TOWER \
     --dataset="sem_seg||refer_seg||vqa||reason_seg" \
     --val_dataset="ade20k|validation" \
-    --vqa_data="llava_v1_5_mix665k" \
+    --vqa_data="llava_instruct_150k" \
     --sample_rates="9,9,5,1" \
     --batch_size=$BATCH_SIZE \
     --grad_accumulation_steps 10 \
@@ -159,7 +160,9 @@ deepspeed --include localhost:${gpu_ids} --master_port=${FREE_PORT} pixar_train_
     --focal_tversky_beta=$FOCAL_BETA \
     --bidir_dim_feedforward 2048 \
     --use_feedback_loop \
-    --auto_resume
+    --auto_resume \
+    --use_llama3_vision_backbone
 
 # --vqa_data="llava_v1_5_mix665k" \
 # --vqa_data="llava_instruct_150k" \
+# --use_llama3_vision_backbone

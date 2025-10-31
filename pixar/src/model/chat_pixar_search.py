@@ -6,13 +6,16 @@ import json
 import time
 import tempfile
 from typing import Optional, Dict, Any, Tuple, List
+from collections import deque
 
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, BitsAndBytesConfig, CLIPImageProcessor
-
+from transformers import (
+    AutoTokenizer, BitsAndBytesConfig,
+    CLIPImageProcessor, LogitsProcessor
+)
 from model.PIXAR import PIXARForCausalLM
 from model.llava import conversation as conversation_lib
 from model.llava.mm_utils import tokenizer_image_token
@@ -24,8 +27,8 @@ from utils.utils import (
     INFORMATION_START_TOKEN, INFORMATION_END_TOKEN,
     DEFAULT_REGION_TOKEN, DEFAULT_IMG_PAYLOAD_TOKEN,
 )
-
-from src.local_search_api import LocalSearchPipeline  # TODO: Revive after fixing the path error
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
+from src.local_search_api import LocalSearchPipeline
 
 
 class TensorEncoder(json.JSONEncoder):
@@ -79,6 +82,46 @@ def preprocess(
 
 # helpers for interrupted decoding after <search> token
 
+class SearchTagGuard(LogitsProcessor):
+    """
+    Guardrail over tool tags:
+      - Ban emitting the first token of </search> when no open <search>
+      - After injecting <information>...</information>, briefly ban starting <search> again (cooldown)
+      - Optionally ban <region> unless we are inside an open <search> payload
+    """
+    def __init__(self, start_ids: list[int], end_ids: list[int], region_ids: list[int]):
+        super().__init__()
+        self.start_ids = list(map(int, start_ids))
+        self.end_ids   = list(map(int, end_ids))
+        self.region_ids = list(map(int, region_ids)) if region_ids is not None else []
+        self.open_count = 0
+        self.cooldown = 0  # number of decoding steps to ban <search> start
+
+    def on_open(self):
+        self.open_count += 1
+
+    def on_close(self):
+        self.open_count = max(0, self.open_count - 1)
+
+    def start_cooldown(self, steps=8):
+        self.cooldown = steps
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        # Ban starting </search> if there is no open <search>
+        if self.open_count == 0 and len(self.end_ids) > 0:
+            scores[:, self.end_ids[0]] = -float("inf")
+
+        # Briefly ban starting a new <search>
+        if self.cooldown > 0 and len(self.start_ids) > 0:
+            scores[:, self.start_ids[0]] = -float("inf")
+            self.cooldown -= 1
+
+        # Ban <region> unless inside a <search> payload (i.e., open)
+        if self.open_count == 0 and len(self.region_ids) > 0:
+            scores[:, self.region_ids[0]] = -float("inf")
+
+        return scores
+
 def tokenizer_decode_special_tokens(ids: torch.Tensor, tokenizer) -> List[int]:
     # map negative/sentinel ids to decodable ids for tokenizer.decode.
     ids = ids.clone()
@@ -94,7 +137,7 @@ def append_text_to_ids(tokenizer, input_ids: torch.Tensor, text: str, device) ->
 
 def find_sub_ids(hay: torch.Tensor, needle: torch.Tensor, start_idx: int = 0) -> Optional[Tuple[int,int]]:
     # return [start, end) indices of first occurrence of needle in hay[start_idx:]
-    if needle.numel() == 0: 
+    if needle.numel() == 0:
         return None
     H = hay.tolist()
     N = needle.tolist()
@@ -146,29 +189,59 @@ def last_span_before(text: str, anchor: str, max_words: int = 8) -> str:
     tokens = re.split(r"\s+", left)
     return " ".join(tokens[-max_words:]).strip()
 
-
 def save_cropped_region(mask_bool: np.ndarray, rgb_image: np.ndarray, out_dir: str, base_name: str, idx: int) -> str:
-    '''
+    """
+    Save the cropped region (tight bbox over the mask) AND a full-image overlay with the mask.
+    Returns only the crop path (not the overlay path).
+
     Args:
-        mask_bool - HxW boolean array (True where foreground)
-        rgb_image - HxWx3 uint8 RGB
-    Returns:
-        out_path - path to the saved crop (PNG).
-    '''
+        mask_bool : (H, W) boolean array, True where foreground.
+        rgb_image : (H, W, 3) uint8 RGB image.
+        out_dir   : output directory.
+        base_name : base filename stem.
+        idx       : integer suffix for uniqueness.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
     H, W = mask_bool.shape
+    mask_u8 = (mask_bool.astype(np.uint8) * 255)
+
+    # ---------- save overlay on the whole image ----------
+    # semi-transparent fill + green contour
+    overlay_rgb = rgb_image.copy()
+    if mask_u8.any():
+        alpha = 0.45
+        tint_rgb = np.array([255, 0, 0], dtype=np.uint8)  # red tint in RGB
+        # apply tint only on masked pixels
+        m = mask_bool
+        overlay_rgb[m] = (overlay_rgb[m].astype(np.float32) * (1.0 - alpha) + tint_rgb.astype(np.float32) * alpha).astype(np.uint8)
+
+        # draw contour for clarity
+        cnts, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
+        cv2.drawContours(overlay_bgr, cnts, -1, (0, 255, 0), 2)  # green contour
+    else:
+        # no foreground: just save original as overlay
+        overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
+
+    overlay_path = os.path.join(out_dir, f"{base_name}_overlay_{idx}.png")
+    cv2.imwrite(overlay_path, overlay_bgr)
+
+    # ---------- save cropped region (fallback to whole image if empty) ----------
     ys, xs = np.where(mask_bool)
     if len(ys) == 0:
-        # fall back to whole image if mask is empty
-        out_path = os.path.join(out_dir, f"{base_name}_region_{idx}_fallback.png")
-        cv2.imwrite(out_path, cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR))
-        return out_path
+        crop_bgr = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+        crop_path = os.path.join(out_dir, f"{base_name}_region_{idx}_fallback.png")
+        cv2.imwrite(crop_path, crop_bgr)
+        return crop_path
 
     y1, y2 = ys.min(), ys.max()
     x1, x2 = xs.min(), xs.max()
-    crop = rgb_image[y1:y2+1, x1:x2+1, :]
-    out_path = os.path.join(out_dir, f"{base_name}_region_{idx}.png")
-    cv2.imwrite(out_path, cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
-    return out_path
+    crop_rgb = rgb_image[y1:y2 + 1, x1:x2 + 1, :]
+    crop_path = os.path.join(out_dir, f"{base_name}_region_{idx}.png")
+    cv2.imwrite(crop_path, cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR))
+
+    return crop_path
 
 
 def generate_with_tools(
@@ -186,6 +259,7 @@ def generate_with_tools(
     vis_save_path: str = "./vis_output",
     max_new_tokens: int = 512,
     device: Optional[torch.device] = None,
+    image_resize_hw: Tuple[int, int] = None,
 ) -> Tuple[torch.Tensor, str]:
     '''
     Streams generation. When `<search> ... </search>` appears, detects payload:
@@ -233,22 +307,22 @@ def generate_with_tools(
         gen_ids = generated[0, base_len:].detach().cpu().long()
         gen_text = tokenizer.decode(tokenizer_decode_special_tokens(gen_ids, tokenizer), skip_special_tokens=False)
         search_span = find_last_closed_span_ids(gen_ids, SEARCH_START_IDS, SEARCH_END_IDS)
-        
+
         print(f">> step: {steps}, new_tok: {gen_text}")
-        
+
         if search_span is None:
             continue
-        
+
         s0, s1, e0, e1 = search_span
         payload_ids = gen_ids[s1:e0]
         payload_text = tokenizer.decode(tokenizer_decode_special_tokens(payload_ids, tokenizer), skip_special_tokens=False)
-        
-        print(f">> step: {steps}, new_tok: {payload_text}")
-        
+
+        print(f">> step: {steps}, payload_text: {payload_text}")
+
         is_image_payload = (payload_ids.tolist() == IMG_IDS.tolist()) or (payload_text == DEFAULT_IMG_PAYLOAD_TOKEN.lower())
         is_region_payload = (payload_ids.tolist() == REGION_IDS.tolist()) or (payload_text == DEFAULT_REGION_TOKEN.lower())
         is_text_payload = not is_image_payload and not is_region_payload
-        
+
         if is_image_payload:
             input_query = [image_path]
         elif is_region_payload:
@@ -279,8 +353,8 @@ def generate_with_tools(
                     images_clip=images_clip,
                     images=image_tensor_for_seg,
                     input_ids=input_ids,
-                    resize_list=[image_np_rgb.shape[:2]],
-                    label_list=[image_np_rgb],
+                    resize_list=[image_resize_hw],
+                    label_list=[image_np_rgb.shape[:2]],
                     attention_masks=attention_masks,
                     gt_bio_span=gt_bio,
                     max_new_tokens=64,  # NOTE: set minimal text span length for region crop;
@@ -307,7 +381,7 @@ def generate_with_tools(
             input_query = payload_text
         else:
             raise ValueError(f"Unknown payload type: {payload_text}")
-        
+
         search_count += 1
         if search_count > max_searches:
             continue
@@ -322,7 +396,7 @@ def generate_with_tools(
         generated = append_text_to_ids(tokenizer, generated, injected, device)
 
     final_text = tokenizer.decode(tokenizer_decode_special_tokens(generated[0], tokenizer), skip_special_tokens=False)
-    
+
     return generated, final_text
 
 
@@ -402,7 +476,8 @@ def main(args):
     elif args.precision == "fp32":
         model = model.float().cuda()
 
-    vision_tower = model.get_model().get_vision_tower().to(device=args.local-rank if hasattr(args, "local-rank") else args.local_rank)
+    device = torch.device("cuda", args.local_rank) if torch.cuda.is_available() else torch.device("cpu")
+    vision_tower = model.get_model().get_vision_tower().to(device=device)
 
     clip_image_processor = CLIPImageProcessor.from_pretrained(model.config.vision_tower)
     transform = ResizeLongestSide(args.image_size)
@@ -478,6 +553,7 @@ def main(args):
             vis_save_path=args.vis_save_path,
             max_new_tokens=512,
             device=input_ids.device,
+            image_resize_hw=resize_list[0],
         )
 
         print("\n********\n>> PIXAR Output (interleaved):")

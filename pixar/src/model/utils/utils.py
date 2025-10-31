@@ -3,19 +3,21 @@ from enum import Enum
 import os
 import yaml
 import json
+import time
 import re
 import cv2
 import pycocotools.mask as mask_utils
 import numpy as np
 import torch
 import torch.distributed as dist
+from typing import Optional, Tuple, List, Union, Dict, Any
 from PIL import Image, ImageOps, ImageFile
 from PIL.Image import Image as PILImage
-
 
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = -200
 DEFAULT_IMAGE_TOKEN = "<image>"
+LLAMA_DEFAULT_IMAGE_TOKEN = "<|image|>"
 DEFAULT_IMAGE_PATCH_TOKEN = "<im_patch>"
 DEFAULT_IM_START_TOKEN = "<im_start>"
 DEFAULT_IM_END_TOKEN = "<im_end>"
@@ -26,6 +28,9 @@ INFORMATION_START_TOKEN = "<information>"
 INFORMATION_END_TOKEN = "</information>"
 DEFAULT_IMG_PAYLOAD_TOKEN = "<img>"
 DEFAULT_REGION_TOKEN = "<region>"
+
+IM_START_ID = 32000
+IM_END_ID   = 32001
 
 QTYPE2ID = {"TEXT": 0, "IMAGE": 1, "REGION": 2}
 
@@ -356,7 +361,7 @@ def _imread_rgb_sans_icc(path: str) -> np.ndarray:
         return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
 
-def _info_char_spans(text: str):
+def _info_char_spans(text: str, info_tok_include: bool = True):
     '''
     Returns list of (start_char, end_char) for the content inside
     <information>...</information> tags (excludes the tags themselves).
@@ -368,10 +373,19 @@ def _info_char_spans(text: str):
         # trim leading/trailing whitespace from the inner span
         ltrim = len(inner) - len(inner.lstrip())
         rtrim = len(inner) - len(inner.rstrip())
-        s += ltrim
-        e -= rtrim
-        if s < e:
-            spans.append((s, e))
+        s_trim = s + ltrim
+        e_trim = e - rtrim
+
+        # Only keep if there's non-empty (post-trim) payload  - TODO: Test this chunk to see if <information> </information> are included
+        if s_trim < e_trim:
+            if info_tok_include:
+                # Inclusive of tags
+                s_all, e_all = m.span(0)
+                spans.append((s_all, e_all))
+            else:
+                # Payload only (exclusive of tags)
+                spans.append((s_trim, e_trim))
+
     return spans
 
 
@@ -381,3 +395,173 @@ def _search_char_spans(text: str):
     Indices cover exactly the 8 characters '<search>'.
     """
     return [(m.start(), m.end()) for m in re.finditer(rf"{SEARCH_START_TOKEN}", text)]
+
+def _find_image_block_row(row_ids: torch.Tensor):
+    """Returns (start_idx, end_idx_exclusive) of <im_start> ... <im_end>,
+       or (None, None) if no image tokens present in this row."""
+    where_start = (row_ids == IM_START_ID).nonzero(as_tuple=False)
+    where_end   = (row_ids == IM_END_ID).nonzero(as_tuple=False)
+    if where_start.numel() == 0 or where_end.numel() == 0:
+        return None, None
+    s = where_start[0].item()
+    e = where_end[0].item()
+    return s, e + 1
+
+def _truncate_row_keep_block(row: torch.Tensor, L: int, block):
+    """Truncate 1D row to length L, preserving [block_start:block_end) if present."""
+    try: # XXXc
+        if row.size(0) <= L:
+            return row, 0  # no shift
+    except Exception as e:
+        print(e)
+        breakpoint()
+
+    if block[0] is None:
+        # no image block → head-truncate
+        return row[:L].contiguous(), 0
+
+    b0, b1 = block
+    block_len = b1 - b0
+    if block_len > L:
+        # cannot preserve; take a head window (still prevents length overflow)
+        return row[:L].contiguous(), 0
+
+    # try to window so the block stays fully inside
+    left = max(0, b0 - (L - block_len) // 2)
+    right = left + L
+    if right < b1:
+        right = b1
+        left = right - L
+    left = max(0, min(left, row.size(0) - L))
+    right = left + L
+    return row[left:right].contiguous(), left
+
+def clamp_conversation_tensors_to_maxlen(
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_masks: torch.Tensor,
+    per_token_labels: torch.Tensor,
+    info_mask_tensors: torch.Tensor,
+    mask_positions_in_input_ids: list,
+    max_len: int,
+):
+    """
+    All tensors are shaped [N_conversations, seq_len].
+    mask_positions_in_input_ids is a list (len=N_conversations) of lists of indices.
+    Truncates rows to max_len while preserving the image block per row when possible,
+    and remaps mask_positions accordingly.
+    """
+    N, L = input_ids.shape
+    new_input_ids = []
+    new_labels = []
+    new_attn = []
+    new_ptl = []
+    new_info_masks = []
+    remapped_positions = []
+
+    for i in range(N):
+        row_ids = input_ids[i]
+        block = _find_image_block_row(row_ids)
+
+        ids_i, shift = _truncate_row_keep_block(row_ids, max_len, block)
+        lab_i, _     = (_truncate_row_keep_block(labels[i], max_len, block) if labels is not None else (torch.zeros_like(ids_i), None))
+        att_i, _     = _truncate_row_keep_block(attention_masks[i], max_len, block)
+        ptl_i, _     = _truncate_row_keep_block(per_token_labels[i], max_len, block)
+        info_masks, _     = _truncate_row_keep_block(info_mask_tensors[i], max_len, block)
+
+        new_input_ids.append(ids_i)
+        new_labels.append(lab_i)
+        new_attn.append(att_i)
+        new_ptl.append(ptl_i)
+        new_info_masks.append(info_masks)
+
+        # remap positions (drop those outside the new window)
+        pos_list = mask_positions_in_input_ids[i] if i < len(mask_positions_in_input_ids) else []
+        remapped = [p - shift for p in pos_list if 0 <= (p - shift) < max_len]
+        remapped_positions.append(remapped)
+
+    input_ids = torch.stack(new_input_ids, dim=0)
+    labels = torch.stack(new_labels, dim=0)
+    attention_masks = torch.stack(new_attn, dim=0)
+    per_token_labels = torch.stack(new_ptl, dim=0)
+    info_masks_tensors = torch.stack(new_info_masks, dim=0)
+
+    return input_ids, labels, attention_masks, per_token_labels, info_masks_tensors, remapped_positions
+
+
+def build_first_sentence_fn():
+    """
+    Try spaCy if available; fall back to a light rule-based splitter.
+    No network download required.
+    """
+    try:
+        import spacy
+        try:
+            nlp = spacy.load("en_core_web_sm")
+        except Exception:
+            # fallback: rule-based sentencizer (no model file)
+            nlp = spacy.blank("en")
+            if "sentencizer" not in nlp.pipe_names:
+                nlp.add_pipe("sentencizer")
+
+        def _first_sentence_spacy(text: str) -> str:
+            if not text:
+                return ""
+            doc = nlp(text.strip())
+            for s in doc.sents:
+                return " ".join(s.text.split())  # collapse whitespace
+            return text.strip().splitlines()[0]  # fallback
+
+        return _first_sentence_spacy
+
+    except Exception:
+        # regex fallback with common abbrev guards
+        import re
+        _ABBR = r"(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|St|Mt|Inc|Ltd|Co|Dept|No|Fig|Eq|Ref|e\.g|i\.e|etc|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|U\.S|U\.K|al)"
+        _EOS = re.compile(
+            rf"""
+            ^\s*                    # leading ws
+            (                       # capture the first sentence
+              .*?                   # non-greedy up to...
+              (?:                   # an end-of-sentence token:
+                 (?<!\b{_ABBR})    #   not an abbrev like "Dr."
+                 (?<!\b[A-Z]\.)    #   not an initial like "A."
+                 (?<!\d)\.         #   period not after a digit
+               | [!?]
+              )
+            )                       # end capture
+            (?:\s+|$)               # followed by space or end
+            """,
+            re.VERBOSE | re.DOTALL,
+        )
+
+        def _first_sentence_regex(text: str) -> str:
+            if not text:
+                return ""
+            text = text.strip()
+            # stop early at a hard newline if it comes before any EOS
+            nl = text.find("\n")
+            if nl != -1 and not any(ch in text[:nl] for ch in ".?!"):
+                return text[:nl].strip()
+            m = _EOS.search(text)
+            if m:
+                return " ".join(m.group(1).strip().split())
+            # final fallback
+            return (text.split("\n", 1)[0] or text)[:280].strip()
+
+        return _first_sentence_regex
+
+def format_payload(payload_contents: List[Union[str, tuple]]):
+    '''
+    Format a list of strings into "|" delimited string.
+    E.g., ["a", "b", "c"] -> "a | b | c"
+    '''
+    if not payload_contents:
+        return ""
+    elif isinstance(payload_contents[0], str):
+        output_text = " | ".join(payload_contents).strip()
+    elif isinstance(payload_contents[0], tuple):
+        output = [f"{p[0].strip()}: {p[1].strip()}" for p in payload_contents]
+        output_text = " | ".join(output).strip()
+
+    return output_text

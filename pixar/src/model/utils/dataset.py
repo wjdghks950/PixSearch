@@ -28,12 +28,18 @@ from .utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                     DEFAULT_IMAGE_TOKEN, IGNORE_INDEX, IMAGE_TOKEN_INDEX,
                     INFORMATION_START_TOKEN, INFORMATION_END_TOKEN,
                     SHORT_QUESTION_LIST, PLUM_ANSWER_LIST,
-                    _info_char_spans, _search_char_spans)
+                    _info_char_spans, _search_char_spans, clamp_conversation_tensors_to_maxlen)
 from .vqa_dataset import VQADataset
 
 
 def collate_fn(
-    batch, tokenizer=None, conv_type="llava_v1", use_mm_start_end=True, local_rank=-1
+    batch,
+    tokenizer=None,
+    conv_type="llava_v1",
+    use_mm_start_end=True,
+    local_rank=-1,
+    model_max_length=1024,
+    info_mask_type="pad"  # or "attn"
 ):
     image_path_list = []
     images_list = []
@@ -113,16 +119,31 @@ def collate_fn(
     targets = input_ids.clone()
     qtype_labels = torch.full_like(input_ids, fill_value=IGNORE_INDEX)
 
+    info_masks_list = []  # one [seq_len] mask per conversation
+
     if conv_type in ["llava_v1", "pixar_0shot_v1"]:
         sep = conv.sep + conv.roles[1] + ": "
     else:
         sep = "[/INST] "
 
-    if (dataset_names[0] in ["textvqa", "gqa", "pope", "cragmm"] and inferences[0] == True):  # handle VQA validation case
-        targets = sampled_classes_list[0]
+    if (dataset_names[0] in [
+        "textvqa",
+        "gqa",
+        "pope",
+        "cragmm",
+        "infoseek",
+        "oven",
+        "hotpotqa",
+        "nq",
+        "triviaqa",
+        "musique",
+        "popqa"
+        ] and inferences[0] == True):  # handle VQA validation case
+        targets = sampled_classes_list
     else:
         for conv_idx, (conversation, target) in enumerate(zip(conversation_list, targets)):
             total_len = int(target.ne(tokenizer.pad_token_id).sum())
+            info_mask_conv = torch.ones_like(target, dtype=torch.long)
 
             rounds = conversation.split(conv.sep2)
             cur_len = 1
@@ -132,7 +153,7 @@ def collate_fn(
                     break
 
                 parts = rou.split(sep)
-                assert len(parts) == 2, (len(parts), rou)
+                assert len(parts) == 2, f"parts: {parts} | rounds: {rounds}"
                 parts[0] += sep
 
                 if DEFAULT_IMAGE_TOKEN in conversation:
@@ -152,25 +173,26 @@ def collate_fn(
                     offsets = enc.offset_mapping
 
                     # find char spans of <information> payloads
-                    info_spans = _info_char_spans(assistant_text)
+                    info_tok_include = True  # set to True to prevent the model from generating <information> tokens
+                    info_spans = _info_char_spans(assistant_text, info_tok_include=info_tok_include) # <information> ... </information>
+
                     if len(info_spans) > 0 and len(asst_ids) > 0:
                         keep_mask = np.ones(len(asst_ids), dtype=bool)
                         for (s_char, e_char) in info_spans:
                             for tok_idx, (s_tok, e_tok) in enumerate(offsets):
-                                if e_tok >= s_char and s_tok <= e_char:
-                                    # do not mask tags since tags need to be preserved for retrieval
+                                if (s_tok < e_char) and (e_tok > s_char):
                                     tok_slice = assistant_text[s_tok:e_tok]
-                                    if "<" in tok_slice or ">" in tok_slice:
-                                        continue
+                                    if not info_tok_include and ("<" in tok_slice or ">" in tok_slice):
+                                        continue  # not masking <information> tokens - NOTE: testing
                                     keep_mask[tok_idx] = False
 
-                        # project assistant-local token indices -> global indices in `target`
                         asst_start = cur_len + instruction_len
-                        max_take = min(len(keep_mask), target.size(0) - asst_start)  # guard against overflow just in case
+                        max_take = min(len(keep_mask), target.size(0) - asst_start)
                         if max_take > 0:
                             ignore_positions = np.where(~keep_mask[:max_take])[0].tolist()
                             for pos in ignore_positions:
                                 target[asst_start + pos] = IGNORE_INDEX
+                                info_mask_conv[asst_start + pos] = 0
 
                         # <search> token qtype label assignment
                         search_tok_spans = _search_char_spans(assistant_text)
@@ -197,18 +219,20 @@ def collate_fn(
             if cur_len < tokenizer.model_max_length:
                 assert cur_len == total_len
 
+            info_masks_list.append(info_mask_conv)
+
     if inferences[0] == False:
         im_start_id = tokenizer.convert_tokens_to_ids(DEFAULT_IM_START_TOKEN)
         has_image_token = (input_ids == im_start_id).any().item()
         reserve = 255 if has_image_token else 0
-        truncate_len = tokenizer.model_max_length - reserve  # hack for adding 255 image patch tokens
+        truncate_len = model_max_length - reserve  # hack for adding 255 image patch tokens
         if input_ids.shape[1] > truncate_len:
             input_ids = input_ids[:, :truncate_len]
             targets = targets[:, :truncate_len]
             attention_masks = attention_masks[:, :truncate_len]
 
-    # construct the BIO tag scheme label here following the input_ids construction
-    per_token_labels_list = []   # will be a list of lists (one per conversation)
+    # construct the BIO label
+    per_token_labels_list = []  # list of lists (one per conversation)
     mask_positions_in_input_ids = []  # list of starting token indices for each conversation
 
     # find the text span within the tokenized input texts that corresponds to the part_text span (this is for embedding sampling for SAM later on)
@@ -293,7 +317,33 @@ def collate_fn(
         else:
             labels = labels[:max_len]
         padded_per_token_labels.append(labels.unsqueeze(0))
-    per_token_labels_tensor = torch.cat(padded_per_token_labels, dim=0)  # shape: [num_convs(across the batches), seq_len]
+    per_token_labels_tensor = torch.cat(padded_per_token_labels, dim=0)  # shape: [num_convs (across the batches), seq_len]
+
+    padded_info_masks = []
+    if len(info_masks_list) > 0:
+        for mask in info_masks_list:
+            if mask.size(0) < max_len:
+                pad = torch.ones(max_len - mask.size(0), dtype=mask.dtype, device=mask.device)
+                mask = torch.cat([mask, pad], dim=0)
+            else:
+                mask = mask[:max_len]
+            padded_info_masks.append(mask.unsqueeze(0))
+    else:
+        padded_info_masks = [torch.zeros(max_len, dtype=torch.long, device=input_ids.device).unsqueeze(0)] * input_ids.size(0)
+
+    info_mask_tensor = torch.cat(padded_info_masks, dim=0)  # shape: [num_convs (across the batches), seq_len]
+
+    # clamp any sequence > model_max_len
+    input_ids, targets, attention_masks, per_token_labels_tensor, info_mask_tensor, mask_positions_in_input_ids = \
+        clamp_conversation_tensors_to_maxlen(
+            input_ids=input_ids,
+            labels=targets if isinstance(targets, torch.Tensor) else None,
+            attention_masks=attention_masks,
+            per_token_labels=per_token_labels_tensor,
+            info_mask_tensors=info_mask_tensor,
+            mask_positions_in_input_ids=mask_positions_in_input_ids,
+            max_len=model_max_length,
+        )
 
     return {
         "image_paths": image_path_list,
@@ -311,6 +361,7 @@ def collate_fn(
         "inference": inferences[0],
         "conversation_list": conversation_list,
         "per_token_labels": per_token_labels_tensor,  # BIO ids per token (same dim as input_ids)
+        "info_masks": info_mask_tensor,  # mask for <information> </information> payload tokens
         "mask_positions_in_input_ids": mask_positions_in_input_ids,  # list of lists of starting token indices per sample
         "qtype_labels": qtype_labels,  # qtype labels per <search> token (same dim as input_ids)
     }
@@ -353,6 +404,8 @@ class HybridDataset(torch.utils.data.Dataset):
         self.tokenizer = tokenizer
         self.precision = precision
         self.datasets = dataset.split("||")
+
+        assert len(sample_rate) == len(self.datasets)
 
         self.all_datasets = []
         for dataset in self.datasets:

@@ -245,27 +245,62 @@ class TextVQAAccuracyEvaluator:
 
         return unique_answer_scores
 
+    def _compute_f1(self, pred_answer, gt_answers):
+        """
+        Compute F1 between predicted and ground-truth answers.
+        Returns 1.0 if any gt_answer is a substring of pred_answer.
+        """
+        pred_tokens = pred_answer.split()
+        best_f1 = 0.0
+
+        for gt in gt_answers:
+            gt_tokens = gt.split()
+
+            # Case 1: substring match → immediate 1.0
+            if gt in pred_answer:
+                return 1.0
+
+            # Case 2: standard F1 computation
+            common = set(pred_tokens) & set(gt_tokens)
+            if len(common) == 0:
+                f1 = 0.0
+            else:
+                precision = len(common) / len(pred_tokens)
+                recall = len(common) / len(gt_tokens)
+                f1 = 2 * precision * recall / (precision + recall)
+            best_f1 = max(best_f1, f1)
+
+        return best_f1
+
     def eval_pred_list(self, pred_list):
         pred_scores = []
+        f1_scores = []
+
         for entry in tqdm(pred_list):
             pred_answer = self.answer_processor(entry["pred_answer"])
+            gt_answers = [self.answer_processor(a) for a in entry["gt_answers"]]
+
+            # accuracy
             unique_answer_scores = self._compute_answer_scores(entry["gt_answers"])
-            score = unique_answer_scores.get(pred_answer, 0.0)
-            pred_scores.append(score)
+            acc = unique_answer_scores.get(pred_answer, 0.0)
+
+            # check substring case if acc == 0
+            if acc == 0.0:
+                for ans in gt_answers:
+                    if ans in pred_answer:
+                        acc = 1.0
+                        break
+
+            # f1 score
+            f1 = self._compute_f1(pred_answer, gt_answers)
+
+            pred_scores.append(acc)
+            f1_scores.append(f1)
 
         accuracy = sum(pred_scores) / len(pred_scores)
-        if accuracy == 0.0:  # since the model is generating auto-regressively, check if it contains any of the ground truth answers
-            if not isinstance(entry["gt_answers"], list):
-                gt_answers_list = [entry["gt_answers"]]
-            else:
-                gt_answers_list = entry["gt_answers"]
-            answers = [self.answer_processor(a) for a in gt_answers_list]
-            for ans in answers:
-                if ans in pred_answer:
-                    accuracy = 1.0
-                    break
-        return accuracy
+        f1_avg = sum(f1_scores) / len(f1_scores)
 
+        return accuracy, f1_avg
 
 class STVQAAccuracyEvaluator:
     def __init__(self):

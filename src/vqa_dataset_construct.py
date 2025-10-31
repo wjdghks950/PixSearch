@@ -545,6 +545,16 @@ def process_sample(args,
         mc_choices = [sample.get("entity_id"), sample.get("entity_text")]
         rationales = []
 
+    elif dataset_name == "cragmm":
+        qid = sample.get("session_id") or str(uuid.uuid4())
+        raw_img = sample.get("image") or sample.get("image_url")
+        image_path = [raw_img] if raw_img is not None else []
+        cached_paths = cache_image(image_path, image_cache_dir, qid)
+        turns = sample.get("turns")
+        question = turns.get("query")[0]
+        mc_choices = []
+        answers = [ans for ans in sample.get("answers").get("ans_full")]
+        rationales = []
     else:
         raise NotImplementedError(f"Dataset {dataset_name} not supported yet.")
 
@@ -646,7 +656,7 @@ def process_sample(args,
         answer_draft_question,
         image_path=image_path,
         incontext_samples=answer_incontext_samples,
-        max_tokens=256,
+        max_tokens=512,
         json_mode=True,
     )
 
@@ -723,7 +733,7 @@ def process_sample(args,
             question + "\n" + str({'answer': answer_draft, 'num_search_toks': num_search_toks}),
             image_path=image_path,
             incontext_samples=incontext_samples_dict["modality_incontext_samples"],
-            max_tokens=256,
+            max_tokens=512,
             json_mode=True,
             json_schema=router_tool,
         )
@@ -1255,9 +1265,9 @@ def parse_args(args: list[str] = None, config_str: str = None):
     parser.add_argument("--topk", default=5, type=int)
 
     # webqa args
-    parser.add_argument("--webqa_tsv_path", default="/home/jeonghkim/projects/region-mm-retrieve/data/webqa/WebQA_imgs/WebQA_imgs_7z_chunks/imgs.tsv", type=str)
-    parser.add_argument("--webqa_lineidx_path", default="/home/jeonghkim/projects/region-mm-retrieve/data/webqa/imgs.lineidx", type=str)
-    parser.add_argument("--webqa_img_cache_dir", default="/home/jeonghkim/projects/region-mm-retrieve/data/webqa/WebQA_imgs", type=str)
+    parser.add_argument("--webqa_tsv_path", default="/home/jeonghkim/projects/pixar/data/webqa/WebQA_imgs/WebQA_imgs_7z_chunks/imgs.tsv", type=str)
+    parser.add_argument("--webqa_lineidx_path", default="/home/jeonghkim/projects/pixar/data/webqa/imgs.lineidx", type=str)
+    parser.add_argument("--webqa_img_cache_dir", default="/home/jeonghkim/projects/pixar/data/webqa/WebQA_imgs", type=str)
 
     # local search api flags
     parser.add_argument("--retriever", default="local", type=str, help="cragmm search api or local faiss index (i.e., local search api)")
@@ -1334,7 +1344,7 @@ def main(args: list[str] = None, config_str: str = None):
             text_model=args.search_api_text_model,
             image_model=args.search_api_image_model,
         )
-    elif retriever == "cragmm":
+    elif args.retriever == "cragmm":
         os.environ["HTTPS_PROXY"] = "http://fwdproxy:8080"
         os.environ["NO_PROXY"] = ",".join([
             ".fbcdn.net", ".facebook.com", ".thefacebook.com", ".tfbnw.net",
@@ -1403,7 +1413,7 @@ def main(args: list[str] = None, config_str: str = None):
                 f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
 
         ########
-        continue  # TODO: Run `calculate_dataset_stats.py` to get the question type statistics first from the `{name}_search_annotated_v1.jsonl` files
+        # continue  # NOTE: Run `calculate_dataset_stats.py` to get the question type statistics first from the `{name}_search_annotated_v1.jsonl` files
         ########
 
         # based on the constructed data and question type stats, interleave `<search> search_query </search>`` tokens
@@ -1438,7 +1448,12 @@ def main(args: list[str] = None, config_str: str = None):
             with open(retrieved_output_file, "r") as f:
                 for line in f:
                     line = line.strip()
-                    retrieved_buffer.append(json.loads(line))
+                    try:
+                        retrieved_buffer.append(json.loads(line))
+                    except json.decoder.JSONDecodeError:
+                        print(f"[warn] failed to parse JSON: {line}", file=sys.stderr)
+                        breakpoint()
+
             print(f">> Loaded from cache: {retrieved_output_file} | len: {len(retrieved_buffer)}")
         if len(retrieved_buffer) < len(interleaved_buffer):
             retrieved_buffer = interleave_retrieved(
