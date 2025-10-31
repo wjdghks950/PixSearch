@@ -91,7 +91,7 @@ def iter_dataset_files(data_root: Path) -> List[Path]:
     Adjust or extend as needed.
     """
     pattern = "{name}/{name}_search_annotated_v1.jsonl"
-    names   = ["aokvqa", "okvqa", "textvqa", "webqa", "infoseek", "oven"]
+    names   = ["cragmm", "aokvqa", "okvqa", "textvqa", "webqa", "infoseek", "oven"]
     return [data_root / pattern.format(name=n) for n in names]
 
 def pretty_print(counter: Counter, title: str) -> None:
