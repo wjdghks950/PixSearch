@@ -15,14 +15,14 @@ from .llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM,
                                                      LlavaLlamaModel)
 from .segment_anything import build_sam_vit_h
 
-try:
-    from deepspeed.utils.zero_to_fp32 import GatheredParameters
-except ImportError:
-    # allows the code to run when DeepSpeed isn't installed
-    from contextlib import contextmanager
-    @contextmanager
-    def GatheredParameters(params, modifier_rank=None):
-        yield
+# try:
+#     from deepspeed.utils.zero_to_fp32 import GatheredParameters
+# except ImportError:
+#     # allows the code to run when DeepSpeed isn't installed
+#     from contextlib import contextmanager
+#     @contextmanager
+#     def GatheredParameters(params, modifier_rank=None):
+#         yield
 
 
 def dice_loss(

@@ -41,7 +41,7 @@ def tokenizer_image_token(
         if return_tensors == "pt":
             return torch.tensor(input_ids, dtype=torch.long)
         raise ValueError(f"Unsupported tensor type: {return_tensors}")
-    
+
     return input_ids
 
 

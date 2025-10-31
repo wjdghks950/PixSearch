@@ -140,7 +140,7 @@ deepspeed --include localhost:${gpu_ids} --master_port=${FREE_PORT} pixar_train_
     --dataset="sem_seg||refer_seg||vqa||reason_seg" \
     --val_dataset="ade20k|validation" \
     --vqa_data="llava_instruct_150k" \
-    --sample_rates="9,9,5,1" \
+    --sample_rates="9,9,6,1" \
     --batch_size=$BATCH_SIZE \
     --grad_accumulation_steps 10 \
     --use_bidir_bio \

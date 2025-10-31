@@ -3,6 +3,7 @@
 # Find a random free port
 FREE_PORT=$(python -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
 
+pip install -U "pydantic<2.0"
 
 # Check if GPU ids are passed as an argument; if not, ask for it.
 if [ -z "$1" ]; then
@@ -34,7 +35,7 @@ deepspeed --include localhost:${gpu_ids} --master_port=${FREE_PORT} validate_vqa
 	  --exp_name=${CKPT_TYPE} \
 	  --llm_model="gpt-4.1-mini" \
 	  --use_llm_as_judge \
-	  --search_api cragmm
+	  --search_api local
 	#   --conv_type pixar_0shot_v1
 
 # for --val_dataset="cragmm" do --llm_model="gpt-4.1-mini" and --use_llm_as_judge \

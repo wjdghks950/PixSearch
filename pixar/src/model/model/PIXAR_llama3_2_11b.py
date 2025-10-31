@@ -586,8 +586,6 @@ class PIXARForCausalLM(LlavaLlamaForCausalLM):
 
             tok = getattr(self.processor, "tokenizer", None)
 
-            breakpoint()
-
             prompts = [tok.decode(seq, skip_special_tokens=True) if tok is not None else "" for seq in input_ids]
 
             # Process image + text through Llama-3.2 Vision backbone
