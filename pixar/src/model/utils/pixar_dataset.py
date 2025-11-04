@@ -88,7 +88,7 @@ class PixarDataset(torch.utils.data.Dataset):
         for ds in self.pixar_data:
             # json_path = f"{ds}_retrieve_k_5_interleaved_{self.jsonl_version}.jsonl"  # v0
             json_path = f"{ds}_retrieve_k_5_gt_interleaved_{self.jsonl_version}.jsonl"  # v1 with gt interleaved in <information> </information>
-            with open(os.path.join(self.base_image_dir, ds, json_path), "r") as reader:
+            with open(os.path.join(self.base_image_dir, "pixar", ds, json_path), "r") as reader:
                 for line in reader:
                     line = line.strip()
                     if not line:
@@ -115,7 +115,11 @@ class PixarDataset(torch.utils.data.Dataset):
         if isinstance(image_path, list):
             image_path = image_path[0]
         image_path_suffix = "/".join(image_path.split("/")[-3:])
-        image_path = os.path.join(self.base_image_dir, image_path_suffix)
+        if "textvqa" in image_path_suffix:
+            image_path_id = image_path_suffix.split("_")[-1].split(".")[0]
+            image_path = os.path.join(self.base_image_dir, "textvqa", "images", image_path_id + ".jpg")
+        else:
+            image_path = os.path.join(self.base_image_dir, "pixar", image_path_suffix)
         image_file_exts = ["jpg", "png", "jpeg", "JPEG", "JPG", "PNG", "webp"]
         if not image_path.endswith(tuple(image_file_exts)):
             try:
