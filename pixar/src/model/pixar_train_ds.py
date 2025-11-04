@@ -31,8 +31,8 @@ except ImportError:
 
 from deepspeed.runtime.zero.utils import ZeRORuntimeException
 
-# from model.PIXAR import PIXARForCausalLM
-from model.PIXAR_llama3_2_11b import PIXARForCausalLM
+from model.PIXAR import PIXARForCausalLM
+# from model.PIXAR_llama3_2_11b import PIXARForCausalLM
 from model.llava import conversation as conversation_lib
 from utils.dataset import HybridDataset, ValDataset, collate_fn
 
@@ -93,7 +93,7 @@ def parse_args(args):
     )
 
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--wandb-project-name", default="plum-training")
+    parser.add_argument("--wandb-project-name", default="pixar-training")
     parser.add_argument("--vqa_data", default="llava_v1_5_mix665k", type=str)  # llava_instruct_150k ; llava_v1_5_mix665k
     parser.add_argument("--reason_seg_data", default="ReasonSeg|train", type=str)
     parser.add_argument("--val_dataset", default="ade20k|validation", type=str)
@@ -106,7 +106,7 @@ def parse_args(args):
 
     # Evaluators
     parser.add_argument('--metrics.iou_evaluator_config', default=IoUEvaluatorConfig(), type=IoUEvaluatorConfig) # NOTE: Change to either reduction='macro' or reduction='micro'
-    parser.add_argument('--predictions_path', default='/home/jeonghkim/projects/pixar/pixar/src/results/predictions.json', type=str)
+    parser.add_argument('--predictions_path', default='../../results/predictions.json', type=str)
     parser.add_argument('--output_predictions', action='store_true', default=True)
 
     # Training args
@@ -424,8 +424,7 @@ def main(args):
         params_to_train.append("bio_encoder")
     if model.use_cross_attn_bio:
         params_to_train.append("bio_cross_attn")
-    if model.use_feedback_loop:
-        params_to_train.append("mask_pooler")
+    # Note: mask_pooler is NOT added here because it doesn't exist yet - will be initialized later
 
     # make text_hidden_fcs, token_to_mask_fcs mask_decoder, lm_head, embed_tokens trainable
     for n, p in model.named_parameters():
@@ -446,6 +445,11 @@ def main(args):
 
     if model.use_feedback_loop:
         model.initialize_mask_pooler()
+        # NOW mark mask_pooler parameters as trainable (after initialization)
+        for n, p in model.named_parameters():
+            if "mask_pooler" in n:
+                print("mask_pooler n: ", n, "p.shape: ", p.shape)
+                p.requires_grad = True
 
     world_size = torch.cuda.device_count()
     args.distributed = world_size > 1
