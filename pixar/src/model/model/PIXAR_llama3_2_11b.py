@@ -835,13 +835,28 @@ class PIXARForCausalLM(LlavaLlamaForCausalLM):
                             dense_embeddings = self.mask_pooler(span_embeds_l, masks_l)
 
                         sparse_embeddings = sparse_embeddings.to(group_proj.dtype)
+                        # Cast mask_decoder to float32 to avoid CuDNN bfloat16 ConvTranspose2d errors
+                        # Convert module to float32 and keep it there - don't restore to avoid dtype mismatch during backward
+                        image_pe = self.model.visual_model.prompt_encoder.get_dense_pe()
+                        original_dtype = image_emb.dtype
+                        
+                        # Convert entire mask_decoder module to float32 (this converts all parameters)
+                        mask_decoder_was_fp32 = next(self.model.visual_model.mask_decoder.parameters()).dtype == torch.float32
+                        if not mask_decoder_was_fp32:
+                            self.model.visual_model.mask_decoder = self.model.visual_model.mask_decoder.float()
+                        
                         low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
-                            image_embeddings=image_emb,
-                            image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
-                            sparse_prompt_embeddings=sparse_embeddings,
-                            dense_prompt_embeddings=dense_embeddings,
+                            image_embeddings=image_emb.to(torch.float32),
+                            image_pe=image_pe.to(torch.float32),
+                            sparse_prompt_embeddings=sparse_embeddings.to(torch.float32),
+                            dense_prompt_embeddings=dense_embeddings.to(torch.float32),
                             multimask_output=False,
                         )
+                        
+                        # Don't restore dtype - keep mask_decoder in float32 to avoid backward dtype mismatch
+                        # If DeepSpeed converts it back, it will be converted again on next forward pass
+                        
+                        low_res_masks = low_res_masks.to(original_dtype)
                         pred_mask = self.model.visual_model.postprocess_masks(
                             low_res_masks,
                             input_size=resize_list[batch_idx],
@@ -886,13 +901,28 @@ class PIXARForCausalLM(LlavaLlamaForCausalLM):
             sparse_embeddings = sparse_embeddings.to(sam_dtype)
             dense_embeddings  = dense_embeddings.to(sam_dtype)
 
+            # Cast mask_decoder to float32 to avoid CuDNN bfloat16 ConvTranspose2d errors
+            # Convert module to float32 and keep it there - don't restore to avoid dtype mismatch during backward
+            image_pe = pe.get_dense_pe()
+            original_dtype = image_emb.dtype
+            
+            # Convert entire mask_decoder module to float32 (this converts all parameters)
+            mask_decoder_was_fp32 = next(self.model.visual_model.mask_decoder.parameters()).dtype == torch.float32
+            if not mask_decoder_was_fp32:
+                self.model.visual_model.mask_decoder = self.model.visual_model.mask_decoder.float()
+            
             low_res_masks, _ = self.model.visual_model.mask_decoder(
-                image_embeddings=image_emb,
-                image_pe=pe.get_dense_pe(),
-                sparse_prompt_embeddings=sparse_embeddings,
-                dense_prompt_embeddings=dense_embeddings,
+                image_embeddings=image_emb.to(torch.float32),
+                image_pe=image_pe.to(torch.float32),
+                sparse_prompt_embeddings=sparse_embeddings.to(torch.float32),
+                dense_prompt_embeddings=dense_embeddings.to(torch.float32),
                 multimask_output=False,
             )
+            
+            # Don't restore dtype - keep mask_decoder in float32 to avoid backward dtype mismatch
+            # If DeepSpeed converts it back, it will be converted again on next forward pass
+            
+            low_res_masks = low_res_masks.to(original_dtype)
             # consume in a zero-weight way so it participates in autograd graph
             _ = (low_res_masks.sum() * 0.0)
 
