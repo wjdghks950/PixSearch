@@ -15,7 +15,7 @@ TIMEOUT_SECONDS = 60
 MAX_RETRIES = 3  # network / rate-limit resilience
 
 # Make sure OPENAI_API_KEY is set in your environment.
-openai_client = openai.Client(timeout=TIMEOUT_SECONDS)
+openai_client = None
 
 
 # --------------------------------------------------------------------------
@@ -23,25 +23,23 @@ openai_client = openai.Client(timeout=TIMEOUT_SECONDS)
 # --------------------------------------------------------------------------
 SYSTEM_MSG = """
 You are an impartial grader. Compare a model's answer with the reference
-answer and decide which of the following four categories best describes
+answer and decide which of the following three categories best describes
 the model answer:
 
 • Perfect      → Score  1.0
-• Acceptable   → Score  0.5
 • Missing      → Score  0.0
 • Incorrect    → Score -1.0
 
 Rules:
 1. A Perfect answer fully satisfies the user question and adds **no
    hallucinated content** beyond what can be inferred from the reference.
-2. An Acceptable answer is mostly correct / helpful but has small errors
-   that do not invalidate the usefulness of the response.
-3. Missing means the model effectively refused or gave no useful info.
-4. Incorrect means the response contains wrong or irrelevant info that
+2. Missing means the model effectively refused, said it could not find the
+   answer, said it did not know, or otherwise gave no useful information.
+3. Incorrect means the response contains wrong or irrelevant info that
    could mislead the user.
 
 Return your result as **one JSON object** with keys:
-  "score"       : one of 1.0, 0.5, 0.0, -1.0
+  "score"       : one of 1.0, 0.0, -1.0
   "explanation" : short (≤ 50 words) reason for the score.
 Do NOT output anything else.
 """.strip()
@@ -59,8 +57,8 @@ def evaluate_answer(
     **chat_completion_kwargs: Dict[str, Any],
 ) -> Tuple[float, str]:
     """
-    Compare `predicted_text` with `ground_truth_text` via GPT-4o
-    and return (score, explanation).
+    Compare `predicted_text` with `ground_truth_text` via GPT and return
+    the CRAG-MM truthfulness score and explanation.
 
     Raises a ValueError if the model’s JSON output cannot be parsed.
     Additional kwargs are forwarded to openai.chat.completions.create().
@@ -77,28 +75,14 @@ def evaluate_answer(
         },
     ]
 
-    resp = openai_client.chat.completions.create(
+    resp = _chat_completion_create(
         model=model,
         messages=messages,
         temperature=TEMPERATURE,
         **chat_completion_kwargs,
     )
 
-    # --------------- Parse the assistant JSON ----------------------------
-    # try:
-    #     raw = resp.choices[0].message.content.strip()
-    #     result = json.loads(raw)
-    #     score = float(result["score"])
-    #     explanation = str(result["explanation"]).strip()
-    # except (KeyError, json.JSONDecodeError, ValueError) as exc:
-    #     raise ValueError(
-    #         f"Could not parse grading JSON from model:\n{resp.choices[0].message.content}"
-    #     ) from exc
-
-    # if score not in (1.0, 0.5, 0.0, -1.0):
-    #     raise ValueError(f"Illegal score {score} returned by the grader LLM.")
-
-    raw = resp.choices[0].message.content
+    raw = _extract_response_content(resp)
     try:
         parsed = _coerce_json(raw)
     except ValueError as e:
@@ -109,10 +93,64 @@ def evaluate_answer(
     score = float(parsed["score"])
     explanation = str(parsed["explanation"]).strip()
 
-    if score not in (1.0, 0.5, 0.0, -1.0):
+    if score not in (1.0, 0.0, -1.0):
         raise ValueError(f"Illegal score {score} parsed from grader.")
 
     return score, explanation
+
+
+def _get_openai_client():
+    global openai_client
+    if openai_client is None:
+        if hasattr(openai, "Client"):
+            openai_client = openai.Client(timeout=TIMEOUT_SECONDS)
+        elif hasattr(openai, "OpenAI"):
+            openai_client = openai.OpenAI(timeout=TIMEOUT_SECONDS)
+    return openai_client
+
+
+def _chat_completion_create(
+    model: str,
+    messages: list[dict[str, str]],
+    temperature: float,
+    **chat_completion_kwargs: Dict[str, Any],
+):
+    client = _get_openai_client()
+    if client is not None:
+        return client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            **chat_completion_kwargs,
+        )
+
+    if hasattr(openai, "ChatCompletion"):
+        request_kwargs = dict(chat_completion_kwargs)
+        request_kwargs.setdefault("request_timeout", TIMEOUT_SECONDS)
+        return openai.ChatCompletion.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            **request_kwargs,
+        )
+
+    raise AttributeError(
+        "Unsupported OpenAI SDK. Expected openai.ChatCompletion or the newer Client/OpenAI interface."
+    )
+
+
+def _extract_response_content(resp: Any) -> str:
+    if hasattr(resp, "choices"):
+        choice = resp.choices[0]
+        if hasattr(choice, "message"):
+            message = choice.message
+            if hasattr(message, "content"):
+                return message.content
+            return message["content"]
+
+    choice = resp["choices"][0]
+    message = choice["message"]
+    return message["content"]
 
 
 def _coerce_json(text: str) -> Dict[str, Any]:

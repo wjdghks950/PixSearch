@@ -217,7 +217,16 @@ def collate_fn(
             target[cur_len:] = IGNORE_INDEX
 
             if cur_len < tokenizer.model_max_length:
-                assert cur_len == total_len
+                try:
+                    assert cur_len == total_len, f"cur_len: {cur_len}, total_len: {total_len}"
+                except Exception as e:
+                    print(f"conversation: {conversation}")
+                    print(f"target: {target}")
+                    print(f"input_ids: {input_ids}")
+                    print(f"attention_masks: {attention_masks}")
+                    print(f"per_token_labels: {per_token_labels}")
+                    print(f"info_masks: {info_masks}")
+                    breakpoint()
 
             info_masks_list.append(info_mask_conv)
 

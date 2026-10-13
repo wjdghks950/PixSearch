@@ -6,6 +6,13 @@ import torch.nn.functional as F
 from typing import List
 from transformers import BitsAndBytesConfig, CLIPVisionModel
 
+# Import distributed utilities for multi-GPU synchronization
+try:
+    import torch.distributed as dist
+    _DIST_AVAILABLE = dist.is_available() and dist.is_initialized()
+except:
+    _DIST_AVAILABLE = False
+
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, IGNORE_INDEX, IMAGE_TOKEN_INDEX,
                          DEFAULT_IMAGE_PATCH_TOKEN, BIO_START_LBL, BIO_INTERM_LBL, BIO_NO_LBL, _with_patch_offset)
 
@@ -721,6 +728,7 @@ class PIXARForCausalLM(LlavaLlamaForCausalLM):
         batch_kl_loss = 0.0
         batch_seg_loss = 0.0
         batch_bce_loss = 0.0
+        dummy_loss_accumulator = torch.tensor(0.0, device=last_hidden_states.device, requires_grad=True)  # Accumulate dummy pass outputs
         group_count = 0  # for each sample, use 'mask_positions_in_input_ids' to group tokens
 
         pred_masks = []
@@ -811,12 +819,12 @@ class PIXARForCausalLM(LlavaLlamaForCausalLM):
                         # Convert module to float32 and keep it there - don't restore to avoid dtype mismatch during backward
                         image_pe = self.model.visual_model.prompt_encoder.get_dense_pe()
                         original_dtype = image_emb.dtype
-                        
+
                         # Convert entire mask_decoder module to float32 (this converts all parameters)
                         mask_decoder_was_fp32 = next(self.model.visual_model.mask_decoder.parameters()).dtype == torch.float32
                         if not mask_decoder_was_fp32:
                             self.model.visual_model.mask_decoder = self.model.visual_model.mask_decoder.float()
-                        
+
                         low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
                             image_embeddings=image_emb.to(torch.float32),
                             image_pe=image_pe.to(torch.float32),
@@ -824,10 +832,10 @@ class PIXARForCausalLM(LlavaLlamaForCausalLM):
                             dense_prompt_embeddings=dense_embeddings.to(torch.float32),
                             multimask_output=False,
                         )
-                        
+
                         # Don't restore dtype - keep mask_decoder in float32 to avoid backward dtype mismatch
                         # If DeepSpeed converts it back, it will be converted again on next forward pass
-                        
+
                         low_res_masks = low_res_masks.to(original_dtype)
                         pred_mask = self.model.visual_model.postprocess_masks(
                             low_res_masks,
@@ -852,53 +860,237 @@ class PIXARForCausalLM(LlavaLlamaForCausalLM):
                         pred_masks.append(pred_mask[:, 0])
                         gt_masks.append(gt_mask)
 
+        # Synchronize group_count across all ranks to ensure consistent execution
+        # This prevents NCCL bucket mismatches when different ranks have different group_count values
+        if _DIST_AVAILABLE:
+            # Convert to tensor for distributed operations
+            group_count_tensor = torch.tensor(group_count, dtype=torch.long, device=last_hidden_states.device)
+            # Find the maximum group_count across all ranks
+            # All ranks must execute the same number of SAM passes to ensure identical computational graphs
+            dist.all_reduce(group_count_tensor, op=dist.ReduceOp.MAX)
+            max_group_count = group_count_tensor.item()
+            # Also find minimum to handle the case where all ranks have 0
+            min_group_count_tensor = torch.tensor(group_count, dtype=torch.long, device=last_hidden_states.device)
+            dist.all_reduce(min_group_count_tensor, op=dist.ReduceOp.MIN)
+            min_group_count = min_group_count_tensor.item()
+        else:
+            max_group_count = group_count
+            min_group_count = group_count
 
-        # no-op pass through SAM when no spans this step - prevent multi-gpu hanging
-        if has_image_tokens and group_count == 0:
-            # fabricate a single dummy query + single image emb to run prompt+decoder
-            # (all multiplied by 0 later; this only anchors the graph for grad compute)
-            sam_dtype = next(self.model.visual_model.mask_decoder.parameters()).dtype
-            with torch.no_grad():
-                image_emb = self.get_visual_embs(images[:1]).to(sam_dtype)
-            dummy_query = self.model.text_hidden_fcs[0](last_hidden_states[:1, :1, :]).mean(dim=1)  # [1, out_dim]
-            dummy_query = dummy_query.to(sam_dtype)
-            sparse_embeddings, dense_embeddings = self.model.visual_model.prompt_encoder(
-                points=None, boxes=None, masks=None, text_embeds=dummy_query.unsqueeze(0)
-            )
-            pe = self.model.visual_model.prompt_encoder
-            sparse_embeddings, dense_embeddings = pe(
-                points=None, boxes=None, masks=None,
-                text_embeds=dummy_query.unsqueeze(0)
-            )
-            sparse_embeddings = sparse_embeddings.to(sam_dtype)
-            dense_embeddings  = dense_embeddings.to(sam_dtype)
+        # Pad ranks with fewer groups using dummy SAM passes to match max_group_count
+        # This ensures all ranks have identical computational graphs
+        if has_image_tokens:
+            # Get the number of dummy passes needed for this rank
+            num_dummy_passes = max_group_count - group_count
 
-            # Cast mask_decoder to float32 to avoid CuDNN bfloat16 ConvTranspose2d errors
-            # Convert module to float32 and keep it there - don't restore to avoid dtype mismatch during backward
-            image_pe = pe.get_dense_pe()
-            original_dtype = image_emb.dtype
-            
-            # Convert entire mask_decoder module to float32 (this converts all parameters)
-            mask_decoder_was_fp32 = next(self.model.visual_model.mask_decoder.parameters()).dtype == torch.float32
-            if not mask_decoder_was_fp32:
-                self.model.visual_model.mask_decoder = self.model.visual_model.mask_decoder.float()
-            
-            low_res_masks, _ = self.model.visual_model.mask_decoder(
-                image_embeddings=image_emb.to(torch.float32),
-                image_pe=image_pe.to(torch.float32),
-                sparse_prompt_embeddings=sparse_embeddings.to(torch.float32),
-                dense_prompt_embeddings=dense_embeddings.to(torch.float32),
-                multimask_output=False,
-            )
-            
-            # Don't restore dtype - keep mask_decoder in float32 to avoid backward dtype mismatch
-            # If DeepSpeed converts it back, it will be converted again on next forward pass
-            
-            low_res_masks = low_res_masks.to(original_dtype)
-            # consume in a zero-weight way so it participates in autograd graph
-            _ = (low_res_masks.sum() * 0.0)
+            # Execute dummy passes if this rank has fewer groups than the maximum
+            if num_dummy_passes > 0:
+                sam_dtype = next(self.model.visual_model.mask_decoder.parameters()).dtype
 
-        if group_count > 0:
+                # CRITICAL: Synchronize image embedding shape across all ranks to ensure
+                # all ranks use the same shape for dummy passes. This is essential because
+                # DeepSpeed ZeRO-2 reduces gradients per parameter shard, and if different
+                # ranks have different gradient shapes for the same shard, the reduction fails.
+                # We synchronize the actual shape dimensions (C, H, W) across ranks and use
+                # the maximum shape for all dummy passes. If a rank doesn't have that shape,
+                # we pad the image embedding to match.
+                if image_embeddings is not None and image_embeddings.size(0) > 0:
+                    # Image embeddings are in [C, H, W] format (from SAM image encoder)
+                    # Get the shape of the largest image embedding on this rank
+                    local_max_shape = None
+                    local_max_spatial_size = 0
+                    for idx in range(image_embeddings.size(0)):
+                        candidate_shape = image_embeddings[idx].shape
+                        # Shape is [C, H, W], so spatial size is H * W
+                        candidate_spatial_size = candidate_shape[-2] * candidate_shape[-1] if len(candidate_shape) >= 2 else 0
+                        if candidate_spatial_size > local_max_spatial_size:
+                            local_max_spatial_size = candidate_spatial_size
+                            local_max_shape = candidate_shape
+
+                    # Synchronize shape dimensions across all ranks
+                    # We'll broadcast [C, H, W] as [C, H, W] tensors
+                    if _DIST_AVAILABLE and local_max_shape is not None:
+                        # Create tensors for each dimension: [C, H, W]
+                        local_shape_tensor = torch.tensor(
+                            [local_max_shape[0], local_max_shape[-2], local_max_shape[-1]],
+                            dtype=torch.long, device=last_hidden_states.device
+                        )
+                        # Find maximum dimensions across all ranks
+                        dist.all_reduce(local_shape_tensor, op=dist.ReduceOp.MAX)
+                        max_shape = (local_shape_tensor[0].item(), local_shape_tensor[1].item(), local_shape_tensor[2].item())
+                    else:
+                        max_shape = local_max_shape if local_max_shape is not None else image_embeddings[0].shape
+
+                    # Find or create an image embedding with the max shape
+                    reference_image_emb = None
+                    for idx in range(image_embeddings.size(0)):
+                        candidate_shape = image_embeddings[idx].shape
+                        if candidate_shape == max_shape:
+                            reference_image_emb = image_embeddings[idx].unsqueeze(0).to(sam_dtype)
+                            break
+
+                    # If no matching shape found, pad the first image embedding to match max shape
+                    if reference_image_emb is None:
+                        # Get the first image embedding and pad it to max_shape
+                        base_emb = image_embeddings[0].to(sam_dtype)  # [C, H, W]
+                        # Calculate padding needed: pad from [C, H, W] to [C, max_H, max_W]
+                        pad_h = max_shape[-2] - base_emb.shape[-2]
+                        pad_w = max_shape[-1] - base_emb.shape[-1]
+                        if pad_h > 0 or pad_w > 0:
+                            # Pad with zeros: pad format is (pad_left, pad_right, pad_top, pad_bottom)
+                            # For [C, H, W], we pad the last two dimensions
+                            reference_image_emb = F.pad(base_emb, (0, pad_w, 0, pad_h), mode='constant', value=0.0).unsqueeze(0)
+                        else:
+                            reference_image_emb = base_emb.unsqueeze(0)
+                else:
+                    # Fallback: create image embedding (shouldn't happen if has_image_tokens is True)
+                    reference_image_emb = self.get_visual_embs(images[:1]).to(sam_dtype)
+
+                # Get a reference hidden state for dummy query generation
+                # Use the first token from the first sequence to ensure consistency
+                if last_hidden_states.size(0) > 0:
+                    dummy_hidden_ref = last_hidden_states[0, :1, :]
+                else:
+                    dummy_hidden_ref = last_hidden_states[:1, :1, :]
+
+                for _ in range(num_dummy_passes):
+                    # Create dummy query using reference hidden state
+                    # Use the SAME approach as real passes to ensure gradient structure matches
+                    dummy_query = self.model.text_hidden_fcs[0](dummy_hidden_ref).mean(dim=0).unsqueeze(0)  # [1, out_dim]
+                    dummy_query = dummy_query.to(sam_dtype)
+
+                    # CRITICAL: Use the SAME image embedding for all dummy passes
+                    # This ensures all dummy passes have identical gradient shapes
+                    image_emb = reference_image_emb
+
+                    # Run SAM prompt encoder
+                    sparse_embeddings, dense_embeddings = self.model.visual_model.prompt_encoder(
+                        points=None, boxes=None, masks=None, text_embeds=dummy_query.unsqueeze(0)
+                    )
+
+                    if self.use_feedback_loop:
+                        dense_embeddings = self.mask_pooler([], [])
+
+                    sparse_embeddings = sparse_embeddings.to(sam_dtype)
+                    dense_embeddings = dense_embeddings.to(sam_dtype)
+
+                    # Cast mask_decoder to float32 to avoid CuDNN bfloat16 ConvTranspose2d errors
+                    image_pe = self.model.visual_model.prompt_encoder.get_dense_pe()
+                    original_dtype = image_emb.dtype
+
+                    # Convert entire mask_decoder module to float32 if needed
+                    mask_decoder_was_fp32 = next(self.model.visual_model.mask_decoder.parameters()).dtype == torch.float32
+                    if not mask_decoder_was_fp32:
+                        self.model.visual_model.mask_decoder = self.model.visual_model.mask_decoder.float()
+
+                    # Run SAM mask decoder
+                    low_res_masks, _ = self.model.visual_model.mask_decoder(
+                        image_embeddings=image_emb.to(torch.float32),
+                        image_pe=image_pe.to(torch.float32),
+                        sparse_prompt_embeddings=sparse_embeddings.to(torch.float32),
+                        dense_prompt_embeddings=dense_embeddings.to(torch.float32),
+                        multimask_output=False,
+                    )
+
+                    low_res_masks = low_res_masks.to(original_dtype)
+                    # Accumulate dummy pass outputs in a way that creates gradients
+                    # This ensures the computational graph structure matches other ranks
+                    # Multiply by 0.0 so it doesn't affect the loss value, but gradients still flow
+                    dummy_loss_accumulator = dummy_loss_accumulator + (low_res_masks.sum() * 0.0)
+
+            # Handle the case where ALL ranks have group_count == 0
+            # Execute a single dummy pass to ensure graph consistency
+            if min_group_count == 0 and max_group_count == 0:
+                # This case is already handled by num_dummy_passes > 0 above
+                # But we need to ensure at least one dummy pass is executed
+                # Since max_group_count == 0, num_dummy_passes would be 0 - group_count (which is 0) = 0
+                # So we need a special case here
+                sam_dtype = next(self.model.visual_model.mask_decoder.parameters()).dtype
+                # IMPORTANT: Do NOT use torch.no_grad() - we need gradients to flow through dummy passes
+                # Use existing image embeddings if available, otherwise compute (but still in graph)
+                if image_embeddings is not None and image_embeddings.size(0) > 0:
+                    image_emb = image_embeddings[0].unsqueeze(0).to(sam_dtype)
+                else:
+                    image_emb = self.get_visual_embs(images[:1]).to(sam_dtype)
+                dummy_query = self.model.text_hidden_fcs[0](last_hidden_states[:1, :1, :]).mean(dim=1)  # [1, out_dim]
+                dummy_query = dummy_query.to(sam_dtype)
+                sparse_embeddings, dense_embeddings = self.model.visual_model.prompt_encoder(
+                    points=None, boxes=None, masks=None, text_embeds=dummy_query.unsqueeze(0)
+                )
+
+                if self.use_feedback_loop:
+                    dense_embeddings = self.mask_pooler([], [])
+
+                sparse_embeddings = sparse_embeddings.to(sam_dtype)
+                dense_embeddings = dense_embeddings.to(sam_dtype)
+
+                # Cast mask_decoder to float32 to avoid CuDNN bfloat16 ConvTranspose2d errors
+                image_pe = self.model.visual_model.prompt_encoder.get_dense_pe()
+                original_dtype = image_emb.dtype
+
+                # Convert entire mask_decoder module to float32 if needed
+                mask_decoder_was_fp32 = next(self.model.visual_model.mask_decoder.parameters()).dtype == torch.float32
+                if not mask_decoder_was_fp32:
+                    self.model.visual_model.mask_decoder = self.model.visual_model.mask_decoder.float()
+
+                low_res_masks, _ = self.model.visual_model.mask_decoder(
+                    image_embeddings=image_emb.to(torch.float32),
+                    image_pe=image_pe.to(torch.float32),
+                    sparse_prompt_embeddings=sparse_embeddings.to(torch.float32),
+                    dense_prompt_embeddings=dense_embeddings.to(torch.float32),
+                    multimask_output=False,
+                )
+
+                low_res_masks = low_res_masks.to(original_dtype)
+                # Accumulate dummy pass outputs to ensure gradients flow
+                dummy_loss_accumulator = dummy_loss_accumulator + (low_res_masks.sum().detach() * 0.0)
+
+        # Synchronize loss accumulation across ranks for proper averaging
+        # Convert losses to tensors if they're not already (handles case where group_count == 0 on a rank)
+        if _DIST_AVAILABLE:
+            # Ensure losses are tensors on the correct device
+            if not isinstance(batch_kl_loss, torch.Tensor):
+                batch_kl_loss = torch.tensor(batch_kl_loss, dtype=torch.float32, device=last_hidden_states.device)
+            else:
+                batch_kl_loss = batch_kl_loss.to(last_hidden_states.device)
+
+            if not isinstance(batch_seg_loss, torch.Tensor):
+                batch_seg_loss = torch.tensor(batch_seg_loss, dtype=torch.float32, device=last_hidden_states.device)
+            else:
+                batch_seg_loss = batch_seg_loss.to(last_hidden_states.device)
+
+            if not isinstance(batch_bce_loss, torch.Tensor):
+                batch_bce_loss = torch.tensor(batch_bce_loss, dtype=torch.float32, device=last_hidden_states.device)
+            else:
+                batch_bce_loss = batch_bce_loss.to(last_hidden_states.device)
+
+            total_group_count_tensor = torch.tensor(group_count, dtype=torch.long, device=last_hidden_states.device)
+
+            # Sum losses and group_count across all ranks
+            dist.all_reduce(batch_kl_loss, op=dist.ReduceOp.SUM)
+            dist.all_reduce(batch_seg_loss, op=dist.ReduceOp.SUM)
+            dist.all_reduce(batch_bce_loss, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_group_count_tensor, op=dist.ReduceOp.SUM)
+
+            total_group_count = total_group_count_tensor.item()
+            if total_group_count > 0:
+                avg_kl_loss = batch_kl_loss / total_group_count
+                avg_seg_loss = batch_seg_loss / total_group_count
+                avg_bce_loss = batch_bce_loss / total_group_count
+            else:
+                avg_kl_loss = torch.tensor(0.0, device=last_hidden_states.device)
+                avg_seg_loss = torch.tensor(0.0, device=last_hidden_states.device)
+                avg_bce_loss = torch.tensor(0.0, device=last_hidden_states.device)
+        elif group_count > 0:
+            # Single GPU case - use local group_count
+            # Ensure losses are tensors
+            if not isinstance(batch_kl_loss, torch.Tensor):
+                batch_kl_loss = torch.tensor(batch_kl_loss, dtype=torch.float32, device=last_hidden_states.device)
+            if not isinstance(batch_seg_loss, torch.Tensor):
+                batch_seg_loss = torch.tensor(batch_seg_loss, dtype=torch.float32, device=last_hidden_states.device)
+            if not isinstance(batch_bce_loss, torch.Tensor):
+                batch_bce_loss = torch.tensor(batch_bce_loss, dtype=torch.float32, device=last_hidden_states.device)
+
             avg_kl_loss = batch_kl_loss / group_count
             avg_seg_loss = batch_seg_loss / group_count
             avg_bce_loss = batch_bce_loss / group_count
@@ -914,7 +1106,8 @@ class PIXARForCausalLM(LlavaLlamaForCausalLM):
                         + self.seg_cls_loss_weight * seg_cls_loss \
                         + self.kld_loss_weight * avg_kl_loss \
                         + self.dice_loss_weight * avg_seg_loss \
-                        + self.bce_loss_weight * avg_bce_loss
+                        + self.bce_loss_weight * avg_bce_loss \
+                        + dummy_loss_accumulator  # Add dummy pass gradients (zero-weight, but ensures graph consistency)
 
         # call self._touch_trainable_modules() to prevent hanging in multi-gpu settings
         if self.training:

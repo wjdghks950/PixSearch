@@ -85,12 +85,12 @@ def classify_question(
 # ────────────────────────────────────────────────────────────────────────────
 # Utility
 # ────────────────────────────────────────────────────────────────────────────
-def iter_dataset_files(data_root: Path) -> List[Path]:
+def iter_dataset_files(data_root: Path, version: int = 1) -> List[Path]:
     """
     Hard-coded list of six dataset sub-folders expected under data_root.
     Adjust or extend as needed.
     """
-    pattern = "{name}/{name}_search_annotated_v1.jsonl"
+    pattern = "{name}/{name}_search_annotated_v" + str(version) + ".jsonl"
     names   = ["cragmm", "aokvqa", "okvqa", "textvqa", "webqa", "infoseek", "oven"]
     return [data_root / pattern.format(name=n) for n in names]
 
@@ -140,6 +140,7 @@ def main() -> None:
     parser.add_argument("--fig_dir", default="/home/jeonghkim/projects/pixar/plots", type=Path, help="Directory to save pie charts")
     parser.add_argument("--model", default="gpt-4.1-mini")
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--version_num", type=int, default=1)
     args = parser.parse_args()
 
     # ── Prepare I/O dirs
@@ -158,7 +159,7 @@ def main() -> None:
         with open(args.out_json) as fh:
             per_dataset_qtypes = defaultdict(list, json.load(fh))
 
-    for jsonl_path in iter_dataset_files(args.data_root):
+    for jsonl_path in iter_dataset_files(args.data_root, args.version_num):
         ds_name = jsonl_path.parent.name
         if not jsonl_path.exists():
             print(f"skip missing {jsonl_path}")

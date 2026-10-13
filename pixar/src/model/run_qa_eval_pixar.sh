@@ -16,12 +16,12 @@ CKPT_TYPE=pixar-13b_kld_0.1_focal_tversky_8_pixar_ft_info_tok_padmask_lr_3e-4_gt
 # CKPT_TYPE=plum-13b_kld_0.1_focal_tversky_8_v1_0shot_w_reasonseg
 
 # DATASET_DIR="/shared/nas/data/m1/jk100/code/OpenAttrLibrary/LISA/dataset"
-DATASET_DIR=/home/jeonghkim/projects/pixar/data/region_rag_vqa
+DATASET_DIR=/shared/nas/data/m1/jk100/code/OpenAttrLibrary/LISA/dataset
 MODEL_CKPT_PATH=./runs/${CKPT_TYPE}/merged_model
-RESULTS_PATH=/home/jeonghkim/projects/pixar/pixar/src/results
+RESULTS_PATH=../../results
 VAL_DATASET=musique # nq, musique, triviaqa, hotpotqa, popqa
 
-export OPENAI_API_KEY="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"
+: "${OPENAI_API_KEY:?Set OPENAI_API_KEY in your environment}"
 
 deepspeed --include localhost:${gpu_ids} --master_port=${FREE_PORT} validate_qa.py \
 	  --version=${MODEL_CKPT_PATH} \

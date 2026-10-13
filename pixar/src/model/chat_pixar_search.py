@@ -27,7 +27,7 @@ from utils.utils import (
     INFORMATION_START_TOKEN, INFORMATION_END_TOKEN,
     DEFAULT_REGION_TOKEN, DEFAULT_IMG_PAYLOAD_TOKEN,
 )
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
 from src.local_search_api import LocalSearchPipeline
 
 
@@ -40,7 +40,7 @@ class TensorEncoder(json.JSONEncoder):
 
 def parse_args(args):
     p = argparse.ArgumentParser(description="PIXAR chat with tool interleaving")
-    p.add_argument("--version", default="/home/jeonghkim/projects/pixar/pixar/src/model/runs/pixar-13b_kld_0.1_focal_tversky_8_pixar_ft/merged_model")
+    p.add_argument("--version", default="./runs/pixar-13b_kld_0.1_focal_tversky_8_pixar_ft/merged_model")
     p.add_argument("--vis_save_path", default="./vis_output", type=str)
     p.add_argument("--precision", default="bf16", choices=["fp32", "bf16", "fp16"])
     p.add_argument("--image_size", default=1024, type=int)

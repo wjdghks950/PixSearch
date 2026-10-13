@@ -1,0 +1,26 @@
+# Separate environment for DINOv3 indexing / synthetic annotation.
+torch==2.6.0
+torchvision==0.21.0
+transformers>=4.56,<5
+datasets>=2.19,<3
+numpy>=1.24,<2
+faiss-cpu==1.8.0.post1
+pyarrow>=14,<18
+openai>=1.30,<2
+fastapi>=0.115,<1
+pydantic>=2.4,<3
+uvicorn>=0.23,<1
+requests>=2.32.2
+pillow>=10,<12
+opencv-python<4.10
+pycocotools
+jsonargparse
+coloredlogs
+einops
+matplotlib<3.9
+tqdm
+scipy
+supervision==0.6.0
+addict
+yapf
+timm

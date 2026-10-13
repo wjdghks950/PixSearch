@@ -1,4 +1,5 @@
 # multimodal_rag_dataset_builder
+from __future__ import annotations
 
 import os, io, json, uuid, time, random, sys
 import logging, argparse, re, glob, requests
@@ -33,9 +34,7 @@ from utils.utils import (
                             append_retrieved_items,
                             call_local_search
                         )
-from crop_cragmm_images import generate_gold_mask
 from local_search_api import LocalSearchPipeline
-from cragmm_search.search import UnifiedSearchPipeline
 
 
 # determine whether a question needs external knowledge or not
@@ -186,6 +185,7 @@ def build_in_context_cache(
     Returns: List[dict]
     """
     cache_path = Path(cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
     if cache_path.exists():
         print(f"[In-Context] Loading {k} examples from cache: {cache_path}")
         with cache_path.open() as f:
@@ -195,10 +195,12 @@ def build_in_context_cache(
                 for sample in incontext_samples:
                     if not sample["content"][-1]["image_url"]["url"].startswith("data:"):
                         img_path = sample["content"][-1]["image_url"]["url"]
+                        parent_path = cache_path.parent.parent
+                        img_path = os.path.join(parent_path, "/".join(img_path.split("/")[-3:]))
                         try:
                             pil_img = image_to_pil(img_path) if not resize_img else resize_keep_aspect(image_to_pil(img_path))
                         except AttributeError:
-                            breakpoint()
+                            raise RuntimeError("Invalid annotation or API response; inspect the preceding diagnostic")
                         img = image_to_base64(pil_img, with_data_uri=True)
                         sample["content"][-1]["image_url"]["url"] = img
                 return incontext_samples
@@ -436,6 +438,7 @@ def call_openai(args,
                 queries = router["queries"]
             return response.choices[0].message.content.strip() if json_schema is None else router
         except Exception as e:
+            raise RuntimeError("Invalid annotation or API response; inspect the preceding diagnostic")
             if backoff is None:        # last attempt – raise
                 raise e
 
@@ -458,6 +461,8 @@ def process_sample(args,
         out_dir: Output directory for saving the results.
         incontext_samples_dict: Dictionary with in-context samples for each prompt type.
     """
+
+    from crop_cragmm_images import generate_gold_mask
 
     # for every dataset_name, cache image_path or load from image_path once qid is already there.
     image_cache_dir = os.path.join(out_dir, "images")
@@ -582,7 +587,7 @@ def process_sample(args,
         needs_retrieval = "true" in needs_resp.lower()
         needs_rationale = ""
         print("DEBUG: needs_json - ", needs_retrieval)
-        breakpoint()
+        raise RuntimeError("Invalid annotation or API response; inspect the preceding diagnostic")
 
     # If needs_retrieval == True, qdecomp and answer_draft should be considered
     if needs_retrieval:
@@ -608,7 +613,7 @@ def process_sample(args,
             qdecomp_subquestions = qdecomp_json["subquestions"]
         except Exception:
             print("DEBUG: qdecomp_json")
-            breakpoint()
+            raise RuntimeError("Invalid annotation or API response; inspect the preceding diagnostic")
 
         # Construct incontext_samples for answer_draft since we need to include the qdecomp_json outputs as well
         user_draft_answer = USER_DRAFT_ANSWER_FOR_RETRIEVAL
@@ -745,14 +750,14 @@ def process_sample(args,
 
         except Exception:
             print("DEBUG: modality_resp - ", modality_resp)
-            breakpoint()
+            raise RuntimeError("Invalid annotation or API response; inspect the preceding diagnostic")
         qtype_reasoning = modality_json["reasoning"]
         for qtype, query_txt in zip(modality_json['query_types'], modality_json['queries']):
             if qtype.upper().strip() not in ["TEXT", "REGION", "IMAGE"]:
                 try:
                     raise ValueError(f"Unknown query type: {qtype}")
                 except ValueError as e:
-                    breakpoint()
+                    raise RuntimeError("Invalid annotation or API response; inspect the preceding diagnostic")
             query_types.append(qtype.upper().strip())
             queries.append(query_txt)
 
@@ -816,7 +821,7 @@ def process_sample(args,
                 try:
                     raise ValueError(f"Unknown query type: {qtype}")
                 except ValueError as e:
-                    breakpoint()
+                    raise RuntimeError("Invalid annotation or API response; inspect the preceding diagnostic")
 
             try:
                 call_entry = {
@@ -831,7 +836,7 @@ def process_sample(args,
                 print(e)
                 print("DEBUG: start_pos - ", start_pos)
                 print("DEBUG: search_tok_idx - ", search_tok_idx)
-                breakpoint()
+                raise RuntimeError("Invalid annotation or API response; inspect the preceding diagnostic")
 
             record["search_calls"].append(call_entry)
             record["decomp_mismatch_cnt"] = decomp_mismatch_cnt
@@ -967,7 +972,7 @@ def interleave_search_and_query(
                     assert all(p == q for p, q in zip(start_pos_list, search_calls_start_pos_list)), f"List Mismatch - start_pos_list: {start_pos_list} | search_calls_start_pos_list: {search_calls_start_pos_list}"
                 except AssertionError as e:
                     print(e)
-                    breakpoint()
+                    raise RuntimeError("Invalid annotation or API response; inspect the preceding diagnostic")
 
                 # perform region span extraction before mutating the answer_draft
                 pos2sc = {}
@@ -1027,40 +1032,9 @@ def interleave_search_and_query(
                                     sc["region_query_span_source"] = "llm"
                                     sc["region_query_span_offsets"] = [start_rtxt, end_rtxt]
 
-                # alignment check and insert <search> payload </search> & interactively fix erroneous instances in case there are errors
-                try:
-                    assert len(search_calls) == len(start_pos_list), f"The length of search_calls and number of <search> tokens must be equal. {len(search_calls)} != {len(start_pos_list)}"
-                except AssertionError as e:
-                    # 1. Rewrite
-                    # 2. Get the new start_pos_list
-                    # 3. assign / drop each search call to its new position according to start_pos_list
-                    print(f"\n\n----MANUAL Filtering (instance number: {i} | dataset_name: {instance['dataset']})----\n")
-                    print(f"(Original) Question: {question}")
-                    print(f"(Original) Answer Draft: {answer_draft}")
-                    print(f"(Search Pos.) <search> tokens starting indices : ", start_pos_list)
-                    print("==============================")
-                    for i, sc in enumerate(search_calls):
-                        print(f"> ({i}) Search Call: {sc}")
-                    print("==============================")
-
-                    if instance['dataset'] == 'oven':
-                        user_prompt = input("Press 'Enter' to continue or type 'fix' to revise...")
-
-                    if user_prompt == "fix" or instance['dataset'] != 'oven':
-                        answer_draft = input("* New Answer Draft >> ")
-                        start_pos_list = sorted([m.start() for m in re.finditer(pattern, answer_draft.lower())])
-                        print("* (new) <search> tokens starting indices : ", start_pos_list)
-                        new_search_calls = []
-                        for i, sc in enumerate(search_calls):
-                            sc['position'] = int(input(f"New pos index for {i}-th <search> token (qtype: {sc['qtype']} | query_text: {sc['query_text']}) (input '-1' to drop the search call): "))
-                            if sc['position'] != -1:
-                                new_search_calls.append(sc)
-                        search_calls = new_search_calls
-                        print(f"** New Answer Draft: {answer_draft}\n")
-                        print(f"** New Search Calls: {search_calls}\n")
-                        input("To Proceed, Press 'Enter'...")
-                    else: # just drop the last search call
-                        search_calls = search_calls[:-1]
+                if len(search_calls) != len(start_pos_list):
+                    raise ValueError(f"Search alignment mismatch for {instance.get('id', i)}; "
+                                     "repair its annotation before rerunning retrieval.")
 
                 for sc in sorted(search_calls, key=lambda c: c["position"], reverse=True):  # reverse order to prevent pos index from being off
                     if sc["qtype"] == "REGION":
@@ -1148,7 +1122,7 @@ def interleave_retrieved(
                             filtered_r = [str(r["entities"]) for r in item]
                         except Exception as e:
                             print(e)
-                            breakpoint()
+                            raise RuntimeError("Invalid annotation or API response; inspect the preceding diagnostic")
                     elif ktype == "title":
                         filtered_r = [str(r["title"]) for r in item]
                     elif ktype == "content":
@@ -1170,6 +1144,10 @@ def parse_args(args: list[str] = None, config_str: str = None):
     parser = argparse.ArgumentParser(
         description="VQA Dataset Construction"
     )
+    parser.add_argument("--datasets", nargs="+", choices=list(DATASETS), default=["cragmm"])
+    parser.add_argument("--split", default=None, help="Override source split (local InfoSeek/OVEN JSONL suffix too)")
+    parser.add_argument("--stage", choices=["annotate", "retrieve", "all"], default="all",
+                        help="annotate, then calculate_dataset_stats.py, then retrieve")
     parser.add_argument("--local_rank", default=0, type=int, help="node rank")
     parser.add_argument("--workers", default=0, type=int, help="number of workers")
     parser.add_argument(
@@ -1227,27 +1205,27 @@ def parse_args(args: list[str] = None, config_str: str = None):
     )
     parser.add_argument(
         "--output_dir",
-        default="/home/jeonghkim/projects/pixar/data/",
+        default="data",
         help="Dataset output directory",
     )
-    parser.add_argument("--dataset_name", default="region_rag_vqa", type=str)
+    parser.add_argument("--dataset_name", default="pixar", type=str)
     parser.add_argument("--question_type_stat_path", default="question_types.json", type=str)
 
     parser.add_argument("--openai_api_key", default=os.getenv("OPENAI_API_KEY"))
     parser.add_argument(
         "--sam_checkpoint",
-        default="/home/jeonghkim/weights/sam/sam_vit_h_4b8939.pth",
+        default="weights/sam_vit_h_4b8939.pth",
     )
     parser.add_argument(
         "--sam_model_type", default="vit_h", choices=["vit_h", "vit_l", "vit_b"]
     )
     parser.add_argument(
         "--dino_config",
-        default="/home/jeonghkim/weights/groundingdino/GroundingDINO_SwinT_OGC.py",
+        default="weights/groundingdino/GroundingDINO_SwinT_OGC.py",
     )
     parser.add_argument(
         "--dino_checkpoint",
-        default="/home/jeonghkim/weights/groundingdino/groundingdino_swint_ogc.pth",
+        default="weights/groundingdino/groundingdino_swint_ogc.pth",
     )
     parser.add_argument("--add_incontext_samples", action="store_true")
     parser.add_argument("--num_incontext_samples", default=8, type=int)
@@ -1265,14 +1243,14 @@ def parse_args(args: list[str] = None, config_str: str = None):
     parser.add_argument("--topk", default=5, type=int)
 
     # webqa args
-    parser.add_argument("--webqa_tsv_path", default="/home/jeonghkim/projects/pixar/data/webqa/WebQA_imgs/WebQA_imgs_7z_chunks/imgs.tsv", type=str)
-    parser.add_argument("--webqa_lineidx_path", default="/home/jeonghkim/projects/pixar/data/webqa/imgs.lineidx", type=str)
-    parser.add_argument("--webqa_img_cache_dir", default="/home/jeonghkim/projects/pixar/data/webqa/WebQA_imgs", type=str)
+    parser.add_argument("--webqa_tsv_path", default="data/pixar/webqa/WebQA_imgs/WebQA_imgs_7z_chunks/imgs.tsv", type=str)
+    parser.add_argument("--webqa_lineidx_path", default="data/pixar/webqa/imgs.lineidx", type=str)
+    parser.add_argument("--webqa_img_cache_dir", default="data/pixar/webqa/WebQA_imgs", type=str)
 
     # local search api flags
     parser.add_argument("--retriever", default="local", type=str, help="cragmm search api or local faiss index (i.e., local search api)")
     parser.add_argument("--search_api_url", default="http://127.0.0.1:7000", type=str)
-    parser.add_argument("--search_api_collection", default="wiki10k_index", type=str)
+    parser.add_argument("--search_api_collection", default="wiki6m_index", type=str)
     parser.add_argument("--search_api_index_name", default=None, type=str)  # optional override
     parser.add_argument("--search_api_pooling", default="mean", choices=["mean", "cls"])
     parser.add_argument("--search_api_text_model", default="sentence-transformers/all-mpnet-base-v2", type=str)
@@ -1286,56 +1264,63 @@ def parse_args(args: list[str] = None, config_str: str = None):
 
 def main(args: list[str] = None, config_str: str = None):
     args, parser = parse_args(args, config_str)
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    client = OpenAI(api_key=args.openai_api_key)
 
     # construct in-context samples
-    incontext_samples_dict = {}
-    incontext_ds = load_dataset("crag-mm-2025/crag-mm-single-turn-public", split="validation")
-    incontext_out_dir = os.path.join(args.output_dir, args.dataset_name, "cragmm")
-    print(">> Constructing in-context samples using cragmm dataset")
-    needs_incontext_samples = build_in_context_cache(
-            args.num_incontext_samples,
-            incontext_ds,
-            "cragmm",
-            os.path.join(incontext_out_dir, args.needs_incontext_cache_path),
-            prompt_type="needs_retrieval",
-            resize_img=True,
-        )
-    qdecomp_incontext_samples = build_in_context_cache(
-            args.num_incontext_samples,
-            incontext_ds,
-            "cragmm",
-            os.path.join(incontext_out_dir, args.qdecomp_incontext_cache_path),
-            prompt_type="qdecomp",
-            resize_img=True,
-        )
-    answer_incontext_samples = build_in_context_cache(
-            args.num_incontext_samples,
-            incontext_ds,
-            "cragmm",
-            os.path.join(incontext_out_dir, args.answer_incontext_cache_path),
-            prompt_type="answer",
-            resize_img=True,
-        )
-    modality_incontext_samples = build_in_context_cache(
-            args.num_incontext_samples,
-            incontext_ds,
-            "cragmm",
-            os.path.join(incontext_out_dir, args.modality_incontext_cache_path),
-            prompt_type="modality",
-            resize_img=True,
-        )
-    incontext_samples_dict["needs_incontext_samples"] = needs_incontext_samples
-    incontext_samples_dict["qdecomp_incontext_samples"] = qdecomp_incontext_samples
-    incontext_samples_dict["answer_incontext_samples"] = answer_incontext_samples
-    incontext_samples_dict["modality_incontext_samples"] = modality_incontext_samples
+    incontext_samples_dict = {key: [] for key in ("needs_incontext_samples", "qdecomp_incontext_samples", "answer_incontext_samples", "modality_incontext_samples")}
+    if args.add_incontext_samples and args.stage != "retrieve":
+        incontext_ds = load_dataset("crag-mm-2025/crag-mm-single-turn-public", split="validation")
+        incontext_out_dir = os.path.join(args.output_dir, args.dataset_name, "cragmm")
+        print(">> Constructing in-context samples using cragmm dataset")
+        needs_incontext_samples = build_in_context_cache(
+                args.num_incontext_samples,
+                incontext_ds,
+                "cragmm",
+                os.path.join(incontext_out_dir, args.needs_incontext_cache_path),
+                prompt_type="needs_retrieval",
+                resize_img=True,
+            )
+        qdecomp_incontext_samples = build_in_context_cache(
+                args.num_incontext_samples,
+                incontext_ds,
+                "cragmm",
+                os.path.join(incontext_out_dir, args.qdecomp_incontext_cache_path),
+                prompt_type="qdecomp",
+                resize_img=True,
+            )
+        answer_incontext_samples = build_in_context_cache(
+                args.num_incontext_samples,
+                incontext_ds,
+                "cragmm",
+                os.path.join(incontext_out_dir, args.answer_incontext_cache_path),
+                prompt_type="answer",
+                resize_img=True,
+            )
+        modality_incontext_samples = build_in_context_cache(
+                args.num_incontext_samples,
+                incontext_ds,
+                "cragmm",
+                os.path.join(incontext_out_dir, args.modality_incontext_cache_path),
+                prompt_type="modality",
+                resize_img=True,
+            )
+        incontext_samples_dict["needs_incontext_samples"] = needs_incontext_samples
+        incontext_samples_dict["qdecomp_incontext_samples"] = qdecomp_incontext_samples
+        incontext_samples_dict["answer_incontext_samples"] = answer_incontext_samples
+        incontext_samples_dict["modality_incontext_samples"] = modality_incontext_samples
 
-    if args.question_type_stat_path is not None:
+    question_type_stat = {}
+    search_pipeline = None
+    if args.stage != "annotate":
+        stats_path = Path(args.output_dir) / args.dataset_name / args.question_type_stat_path
+        if not stats_path.exists():
+            raise FileNotFoundError(f"Missing {stats_path}. Run --stage annotate, then calculate_dataset_stats.py first.")
+    if args.stage != "annotate":
         with open(os.path.join(args.output_dir, args.dataset_name, args.question_type_stat_path), "r") as fp:
             question_type_stat = json.load(fp)
             print(f">> Loaded question type stats from {args.question_type_stat_path}")
 
-    if args.retriever is None or args.retriever == "local":
+    if args.stage != "annotate" and args.retriever == "local":
         search_pipeline = LocalSearchPipeline(
             base_url=args.search_api_url,
             collection=args.search_api_collection,
@@ -1344,12 +1329,13 @@ def main(args: list[str] = None, config_str: str = None):
             text_model=args.search_api_text_model,
             image_model=args.search_api_image_model,
         )
-    elif args.retriever == "cragmm":
-        os.environ["HTTPS_PROXY"] = "http://fwdproxy:8080"
-        os.environ["NO_PROXY"] = ",".join([
-            ".fbcdn.net", ".facebook.com", ".thefacebook.com", ".tfbnw.net",
-            ".fb.com", ".fburl.com", ".facebook.net", ".sb.fbsbx.com", "localhost"
-        ])
+    elif args.stage != "annotate" and args.retriever == "cragmm":
+        from cragmm_search.search import UnifiedSearchPipeline
+        # os.environ["HTTPS_PROXY"] = "http://fwdproxy:8080"  # TODO: use only within Meta internal
+        # os.environ["NO_PROXY"] = ",".join([
+        #     ".fbcdn.net", ".facebook.com", ".thefacebook.com", ".tfbnw.net",
+        #     ".fb.com", ".fburl.com", ".facebook.net", ".sb.fbsbx.com", "localhost"
+        # ])
         search_pipeline = UnifiedSearchPipeline(
             image_model_name="openai/clip-vit-large-patch14-336",
             image_hf_dataset_id="crag-mm-2025/image-search-index-validation",
@@ -1358,23 +1344,27 @@ def main(args: list[str] = None, config_str: str = None):
         )
 
     # generate data samples for the datasets
-    for ds_name, cfg in DATASETS.items():
+    for ds_name in args.datasets:
+        cfg = DATASETS[ds_name]
+        split = args.split or cfg["split"]
 
         print(f"\n### Processing {ds_name} ###")
         ds = []
-        if ds_name == "infoseek":  # infoseek_train.jsonl causes error if loaded with `datasets.load_dataset`
-            with open(os.path.join(args.output_dir, args.infoseek_path, "infoseek_train.jsonl"), "r") as fp_reader:
+        if args.stage == "retrieve":
+            pass  # Use cached annotations; do not reload or annotate the source split.
+        elif ds_name == "infoseek":  # infoseek_train.jsonl causes error if loaded with `datasets.load_dataset`
+            with open(os.path.join(args.output_dir, args.dataset_name, args.infoseek_path, f"infoseek_{split}.jsonl"), "r") as fp_reader:
                 for idx, line in enumerate(tqdm(fp_reader, desc="Loading infoseek_train.jsonl")):
-                    if idx >= args.infoseek_limit_num:
+                    if args.infoseek_limit_num > 0 and idx >= args.infoseek_limit_num:
                         break
                     line = line.strip()
                     rec = json.loads(line)
                     rec["image"] = load_image_by_id(Path(os.path.join(args.output_dir, args.infoseek_path, "images")), rec["image_id"])
                     ds.append(rec)
         elif ds_name == "oven":  # TODO: Later, oven_query_train.jsonl maybe used alongside `oven_entity_train.jsonl`
-            with open(os.path.join(args.output_dir, args.infoseek_path, "oven_entity_train.jsonl"), "r") as fp_reader:
+            with open(os.path.join(args.output_dir, args.dataset_name, "oven", f"oven_entity_{split}.jsonl"), "r") as fp_reader:
                 for idx, line in enumerate(tqdm(fp_reader, desc="Loading oven_entity_train.jsonl")):
-                    if idx >= args.infoseek_limit_num:
+                    if args.infoseek_limit_num > 0 and idx >= args.infoseek_limit_num:
                         break
                     line = line.strip()
                     rec = json.loads(line)
@@ -1383,7 +1373,7 @@ def main(args: list[str] = None, config_str: str = None):
                     rec["image"] = load_image_by_id(Path(os.path.join(args.output_dir, args.infoseek_path, "images")), rec["image_id"])
                     ds.append(rec)
         else:
-            ds = load_dataset(cfg["hf_name"], split=cfg["split"], trust_remote_code=True)
+            ds = load_dataset(cfg["hf_name"], split=split, trust_remote_code=True)
 
         out_dir = os.path.join(args.output_dir, args.dataset_name, ds_name)
         os.makedirs(out_dir, exist_ok=True)
@@ -1397,20 +1387,29 @@ def main(args: list[str] = None, config_str: str = None):
                     buffer.append(json.loads(line))
             print(f">> Loaded from cache: {output_file} | len: {len(buffer)}")
 
+        if args.stage == "retrieve" and not buffer:
+            raise ValueError(f"No annotations found in {output_file}; run --stage annotate first")
+        processed_source_indices = {row.get("source_index", i) for i, row in enumerate(buffer)}
         # construct the dataset
         with open(output_file, "a") as f:
             for idx, sample in enumerate(tqdm(ds, total=len(ds))):
-                if len(buffer) > idx:
+                if args.stage == "retrieve":
+                    break
+                if idx in processed_source_indices:
                     continue
-                if len(buffer) >= args.limit_num:
+                if args.limit_num > 0 and len(buffer) >= args.limit_num:
                     break
                 rec = process_sample(args, client, sample, ds_name, out_dir, incontext_samples_dict)
                 if rec is None:
                     # dropped due to invalid JSON or <search> token mismatch
                     print(f">> Skipping invalid JSON or <search> token mismatch: ds_name: {ds_name} | idx: {idx} | len: {len(buffer)}")
                     continue
+                rec["source_index"] = idx
                 buffer.append(rec)
                 f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+
+        if args.stage == "annotate":
+            continue
 
         ########
         # continue  # NOTE: Run `calculate_dataset_stats.py` to get the question type statistics first from the `{name}_search_annotated_v1.jsonl` files
@@ -1452,7 +1451,7 @@ def main(args: list[str] = None, config_str: str = None):
                         retrieved_buffer.append(json.loads(line))
                     except json.decoder.JSONDecodeError:
                         print(f"[warn] failed to parse JSON: {line}", file=sys.stderr)
-                        breakpoint()
+                        raise RuntimeError("Invalid annotation or API response; inspect the preceding diagnostic")
 
             print(f">> Loaded from cache: {retrieved_output_file} | len: {len(retrieved_buffer)}")
         if len(retrieved_buffer) < len(interleaved_buffer):

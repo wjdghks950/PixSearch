@@ -114,19 +114,19 @@ class PixarDataset(torch.utils.data.Dataset):
         image_path = s.get("image_path", "")
         if isinstance(image_path, list):
             image_path = image_path[0]
-        image_path_suffix = "/".join(image_path.split("/")[-3:])
-        if "textvqa" in image_path_suffix:
-            image_path_id = image_path_suffix.split("_")[-1].split(".")[0]
-            image_path = os.path.join(self.base_image_dir, "textvqa", "images", image_path_id + ".jpg")
-        else:
-            image_path = os.path.join(self.base_image_dir, "pixar", image_path_suffix)
+        if not os.path.isfile(image_path):
+            image_path_suffix = "/".join(image_path.split("/")[-3:])
+            if "textvqa" in image_path_suffix:
+                image_path_id = image_path_suffix.split("_")[-1].split(".")[0]
+                image_path = os.path.join(self.base_image_dir, "textvqa", "images", image_path_id + ".jpg")
+            else:
+                image_path = os.path.join(self.base_image_dir, "pixar", image_path_suffix)
         image_file_exts = ["jpg", "png", "jpeg", "JPEG", "JPG", "PNG", "webp"]
         if not image_path.endswith(tuple(image_file_exts)):
             try:
                 image_path = [f"{image_path}.{ext}" for ext in image_file_exts if os.path.exists(f"{image_path}.{ext}")][0]
             except Exception as e:
-                print(f"image_path: {image_path}")
-                breakpoint()
+                raise FileNotFoundError(f"Missing training image: {image_path}") from e
 
         question = s.get("question", "")
         decomposed_questions = s.get("decomposed_questions", None)

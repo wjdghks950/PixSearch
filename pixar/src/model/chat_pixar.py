@@ -30,7 +30,7 @@ class TensorEncoder(json.JSONEncoder):
 
 def parse_args(args):
     parser = argparse.ArgumentParser(description="PIXAR chat")
-    parser.add_argument("--version", default="/home/jeonghkim/projects/pixar/pixar/src/model/runs/pixar-13b_kld_0.1_focal_tversky_8_pixar_ft/merged_model")
+    parser.add_argument("--version", default="./runs/pixar-13b_kld_0.1_focal_tversky_8_pixar_ft/merged_model")
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
     parser.add_argument(
         "--precision",

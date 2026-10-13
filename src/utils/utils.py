@@ -1,4 +1,5 @@
 import re
+import time
 import os
 import io
 import ast
@@ -30,26 +31,20 @@ TEMPERATURE = 0.2
 RETRY_BACKOFF_SECONDS = [5, 10, 20]
 
 # FB devserver proxy for external web connection establishment
-os.environ["HTTPS_PROXY"] = "http://fwdproxy:8080"
-os.environ["NO_PROXY"] = ",".join([
-    ".fbcdn.net", ".facebook.com", ".thefacebook.com", ".tfbnw.net",
-    ".fb.com", ".fburl.com", ".facebook.net", ".sb.fbsbx.com", "localhost"
-])
+# os.environ["HTTPS_PROXY"] = "http://fwdproxy:8080"
+# os.environ["NO_PROXY"] = ",".join([
+#     ".fbcdn.net", ".facebook.com", ".thefacebook.com", ".tfbnw.net",
+#     ".fb.com", ".fburl.com", ".facebook.net", ".sb.fbsbx.com", "localhost"
+# ])
 
 DATASETS = {
     "cragmm": {"hf_name": "crag-mm-2025/crag-mm-single-turn-public", "split": "validation"},
-    # "aokvqa":  {"hf_name": "HuggingFaceM4/A-OKVQA", "split": "train"},
-    # "okvqa":   {"hf_name": "HuggingFaceM4/OK-VQA",   "split": "train"},
-    # "webqa":   {"hf_name": "TreezzZ/WebQA",       "split": "train"},
-    # "textvqa": {"hf_name": "lmms-lab/textvqa", "split": "train"},
-    # "infoseek": {"hf_name": "ychenNLP/oven", "split": "train"},
-    # "oven": {"hf_name": "ychenNLP/oven", "split": "train"},
-    # "vizwiz":  {"hf_name": "HuggingFaceM4/VizWiz", "split": "train"},
-    # "encyclopedicvqa": {"hf_name": "", "split": "train"},
-    # "visual_genome": {"hf_name": "visual_genome", "split": "train"},
-    # "kvqa":    {"hf_name": "AdaptAI/KVQA",          "split": "train"},
-    # "pathvqa": {"hf_name": "shapenshap/pathvqa",    "split": "train"},
-    # "scienceqa": {"hf_name": "lukaemon/ScienceQA",  "split": "train"},
+    "aokvqa": {"hf_name": "HuggingFaceM4/A-OKVQA", "split": "train"},
+    "okvqa": {"hf_name": "HuggingFaceM4/OK-VQA", "split": "train"},
+    "webqa": {"hf_name": "TreezzZ/WebQA", "split": "train"},
+    "textvqa": {"hf_name": "lmms-lab/textvqa", "split": "train"},
+    "infoseek": {"hf_name": None, "split": "train"},
+    "oven": {"hf_name": None, "split": "train"},
 }
 
 
@@ -111,7 +106,11 @@ def call_local_search(
 
 def save_faiss_checkpoint(idx, meta_batches, progress_path, index_path, meta_dir, line_no, next_id):
     # write / overwrite the faiss index
-    faiss.write_indx(idx, str(index_path))
+    import faiss
+    import pyarrow as pa
+    import pyarrow.feather as feather
+
+    faiss.write_index(idx, str(index_path))
 
     # flush buffered metadata, one shard per checkpoint
     if meta_batches:

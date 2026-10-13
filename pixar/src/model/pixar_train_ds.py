@@ -192,6 +192,9 @@ def main(args):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
+    if args.zero_shot_ckpt_path and not os.path.isfile(os.path.join(args.zero_shot_ckpt_path, "latest")):
+        raise FileNotFoundError("--zero_shot_ckpt_path must contain a DeepSpeed latest file")
+
     # set up run_name and run_ckpt_path
     run_name = (f"{args.exp_name}_maxlen{args.model_max_length}"
                     f"_epochs{args.epochs}_bsz{args.batch_size}"
@@ -266,36 +269,37 @@ def main(args):
         os.makedirs(args.log_dir, exist_ok=True)
         writer = SummaryWriter(args.log_dir)
 
-        # wandb logging
-        import dataclasses
-        from enum import Enum
+        if args.wandb:
+            # wandb logging
+            import dataclasses
+            from enum import Enum
 
-        config_for_wandb = {}
-        for arg_key, arg_value in vars(args).items():
-            if dataclasses.is_dataclass(arg_value) and not isinstance(arg_value, type):
-                # Convert dataclass instance to dict and sanitize enums
-                try:
-                    dict_representation = dataclasses.asdict(arg_value)
-                    sanitized_dict = {}
-                    for k_inner, v_inner in dict_representation.items():
-                        if isinstance(v_inner, Enum):
-                            sanitized_dict[k_inner] = v_inner.name
-                        else:
-                            sanitized_dict[k_inner] = v_inner
-                    config_for_wandb[arg_key] = sanitized_dict
-                except Exception as e:
-                    print(f"Warning: Could not fully serialize dataclass arg {arg_key} to dict for wandb: {e}. Using str() as fallback.")
-                    config_for_wandb[arg_key] = str(arg_value)
-            elif isinstance(arg_value, Enum):
-                 config_for_wandb[arg_key] = arg_value.name
-            else:
-                config_for_wandb[arg_key] = arg_value
+            config_for_wandb = {}
+            for arg_key, arg_value in vars(args).items():
+                if dataclasses.is_dataclass(arg_value) and not isinstance(arg_value, type):
+                    # Convert dataclass instance to dict and sanitize enums
+                    try:
+                        dict_representation = dataclasses.asdict(arg_value)
+                        sanitized_dict = {}
+                        for k_inner, v_inner in dict_representation.items():
+                            if isinstance(v_inner, Enum):
+                                sanitized_dict[k_inner] = v_inner.name
+                            else:
+                                sanitized_dict[k_inner] = v_inner
+                        config_for_wandb[arg_key] = sanitized_dict
+                    except Exception as e:
+                        print(f"Warning: Could not fully serialize dataclass arg {arg_key} to dict for wandb: {e}. Using str() as fallback.")
+                        config_for_wandb[arg_key] = str(arg_value)
+                elif isinstance(arg_value, Enum):
+                     config_for_wandb[arg_key] = arg_value.name
+                else:
+                    config_for_wandb[arg_key] = arg_value
 
-        wandb.init(
-            project=args.wandb_project_name,
-            name=run_name,
-            config=config_for_wandb # Use the sanitized config
-        )
+            wandb.init(
+                project=args.wandb_project_name,
+                name=run_name,
+                config=config_for_wandb # Use the sanitized config
+            )
     else:
         writer = None
 
@@ -306,7 +310,6 @@ def main(args):
         model_max_length=args.model_max_length,
         padding_side="right",
         use_fast=True,
-        legacy=False,  # NOTE: non-legacy token handling
     )
     tokenizer.pad_token = tokenizer.unk_token
 
@@ -698,13 +701,14 @@ def main(args):
             except NameError:
                 pass
 
-            wandb.log({
-                "val/giou": pre_giou,
-                "val/ciou": pre_ciou,
-                "val/b_acc": pre_bio_per_cls_acc[1],
-                "val/i_acc": pre_bio_per_cls_acc[2],
-                "val/o_acc": pre_bio_per_cls_acc[0],
-            }, step=0)
+            if args.wandb:
+                wandb.log({
+                    "val/giou": pre_giou,
+                    "val/ciou": pre_ciou,
+                    "val/b_acc": pre_bio_per_cls_acc[1],
+                    "val/i_acc": pre_bio_per_cls_acc[2],
+                    "val/o_acc": pre_bio_per_cls_acc[0],
+                }, step=0)
 
     if args.eval_only:
         giou, ciou, bio_per_cls_acc = validate(val_loader, model_engine, tokenizer, 0, writer, args)
@@ -737,13 +741,14 @@ def main(args):
                 writer.add_scalar("val/giou", giou, epoch)
                 writer.add_scalar("val/ciou", ciou, epoch)
                 # wandb logging
-                wandb.log({
-                    "val/giou": giou,
-                    "val/ciou": ciou,
-                    "val/b_acc": bio_per_cls_acc[1],
-                    "val/i_acc": bio_per_cls_acc[2],
-                    "val/o_acc": bio_per_cls_acc[0]
-                })
+                if args.wandb:
+                    wandb.log({
+                        "val/giou": giou,
+                        "val/ciou": ciou,
+                        "val/b_acc": bio_per_cls_acc[1],
+                        "val/i_acc": bio_per_cls_acc[2],
+                        "val/o_acc": bio_per_cls_acc[0]
+                    })
                 epoch_metrics[epoch] = {
                     'giou': float(giou),
                     'ciou': float(ciou),
@@ -907,17 +912,18 @@ def train(
                 )
 
                 # wandb logging
-                wandb.log({
-                    "train/loss": losses.avg,
-                    "train/ce_loss": ce_losses.avg,
-                    "train/seg_cls_loss": seg_cls_losses.avg,
-                    "train/kl_loss": kl_losses.avg,
-                    "train/mask_bce_loss": mask_bce_losses.avg,
-                    "train/mask_dice_loss": mask_dice_losses.avg,
-                    "train/mask_loss": mask_losses.avg,
-                    "metrics/total_secs_per_batch": batch_time.avg,
-                    "metrics/data_secs_per_batch": data_time.avg
-                }, step=total_step)
+                if args.wandb:
+                    wandb.log({
+                        "train/loss": losses.avg,
+                        "train/ce_loss": ce_losses.avg,
+                        "train/seg_cls_loss": seg_cls_losses.avg,
+                        "train/kl_loss": kl_losses.avg,
+                        "train/mask_bce_loss": mask_bce_losses.avg,
+                        "train/mask_dice_loss": mask_dice_losses.avg,
+                        "train/mask_loss": mask_losses.avg,
+                        "metrics/total_secs_per_batch": batch_time.avg,
+                        "metrics/data_secs_per_batch": data_time.avg
+                    }, step=total_step)
 
             batch_time.reset()
             data_time.reset()
@@ -934,7 +940,8 @@ def train(
             curr_lr = scheduler.get_last_lr()
             if args.local_rank == 0:
                 writer.add_scalar("train/lr", curr_lr[0], total_step)
-                wandb.log({"train/lr": curr_lr[0]}, step=total_step)
+                if args.wandb:
+                    wandb.log({"train/lr": curr_lr[0]}, step=total_step)
 
     return train_iter
 
@@ -1121,6 +1128,61 @@ def validate(val_loader, model_engine, tokenizer, epoch, writer, args):
             json.dump(predictions_dict, f)
 
     return giou, ciou, (o_acc, b_acc, i_acc) # bio_per_cls_acc
+
+
+@torch.no_grad()  # TODO: Evaluate this function to check its correctness
+def validate_vqa(model_engine, tokenizer, epoch, writer, args):
+    """
+    Validate the model on VQA (cragmm|validation) after segmentation validation.
+    Uses validate_vqa.py logic but simplified for integration.
+    """
+    from validate_vqa import parse_args as vqa_parse_args, main as vqa_main
+
+    if args.local_rank == 0:
+        print(f"\n============================")
+        print(f">> Running validate_vqa on cragmm|validation after epoch {epoch}")
+        print(f"============================")
+
+    # build vqa args programmatically
+    vqa_args_str = f"""
+        --version {args.version}
+        --val_dataset cragmm|validation
+        --val_batch_size 1
+        --dataset_dir {args.dataset_dir}
+        --precision {args.precision}
+        --vision-tower {args.vision_tower}
+        --use_mm_start_end
+        --model_max_length {args.model_max_length}
+        --local_rank {args.local_rank}
+        --search_api cragmm
+        --predictions_path {os.path.join(args.log_dir, 'vqa_results')}
+        --llm_model gpt-4o
+    """
+
+    vqa_args, vqa_parser = vqa_parse_args([], vqa_args_str)
+    # run validation (will save predictions and compute accuracy)
+    vqa_main([], vqa_args_str)
+
+    # load logged accuracy from results directory
+    pred_file_path = os.path.join(
+        vqa_args.predictions_path,
+        f'predictions_cragmm_validation_{vqa_args.llm_model}_False_search_api_{vqa_args.search_api}.jsonl'
+    )
+    if os.path.exists(pred_file_path):
+        with open(pred_file_path, 'r') as f:
+            records = [json.loads(line) for line in f.readlines()]
+        vqa_acc = sum(d['accuracy'] for d in records) / max(1, len(records))
+    else:
+        vqa_acc = 0.0
+
+    if args.local_rank == 0:
+        print(f">> [validate_vqa] Epoch {epoch} Accuracy: {vqa_acc:.4f}")
+        writer.add_scalar("val_vqa/accuracy", vqa_acc, epoch)
+        if args.wandb:
+            wandb.log({"val_vqa/accuracy": vqa_acc}, step=epoch)
+
+    return vqa_acc
+
 
 
 @torch.no_grad()

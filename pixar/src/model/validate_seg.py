@@ -60,7 +60,7 @@ def parse_args(args: list[str] = None, config_str: str = None):
 
     # Model
     parser.add_argument("--local_rank", default=0, type=int, help="node rank")
-    parser.add_argument("--backbone", default="/home/jeonghkim/projects/pixar/hf_cache/llava-llama-2-13b-chat-lightning-preview", type=str)
+    parser.add_argument("--backbone", default="liuhaotian/llava-llama-2-13b-chat-lightning-preview", type=str)
     parser.add_argument("--version", default=None)
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
     parser.add_argument(
@@ -103,7 +103,7 @@ def parse_args(args: list[str] = None, config_str: str = None):
                         help='Prompts the model with the GT object label for testing; GT masks are set to the full image')
 
     parser.add_argument('--output_predictions', action='store_true')
-    parser.add_argument('--predictions_path', default='/home/jeonghkim/projects/pixar/pixar/src/results/predictions.json', type=str)
+    parser.add_argument('--predictions_path', default='./predictions.json', type=str)
 
     # Evaluators
     parser.add_argument('--metrics.iou_evaluator_config', default=IoUEvaluatorConfig(), type=IoUEvaluatorConfig) # NOTE: Change to either reduction='macro' or reduction='micro'

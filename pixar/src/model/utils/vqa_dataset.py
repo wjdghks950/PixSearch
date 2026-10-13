@@ -183,6 +183,7 @@ class TextVQADataset(torch.utils.data.Dataset):
         exclude_val=False,
         vqa_data="TextVQA_0.5.1_val",
         use_mm_start_end=False,
+        use_pil_image=False,
     ):
         self.exclude_val = exclude_val
         self.samples_per_epoch = samples_per_epoch
@@ -195,8 +196,8 @@ class TextVQADataset(torch.utils.data.Dataset):
         self.transform = ResizeLongestSide(image_size)
         self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
 
-        DATA_DIR = os.path.join(base_image_dir, "textvqa")
-        self.textvqa_image_root = os.path.join(base_image_dir, "textvqa/images")
+        DATA_DIR = os.path.join(base_image_dir, "pixar", "textvqa")
+        self.textvqa_image_root = os.path.join(base_image_dir, "textvqa/train_images")
         with open(os.path.join(DATA_DIR, "{}.json".format(vqa_data))) as f:
             textvqa_data = json.load(f)
         self.textvqa_data = textvqa_data["data"]
@@ -204,6 +205,7 @@ class TextVQADataset(torch.utils.data.Dataset):
         self.dataset_name = textvqa_data["dataset_name"]
         self.dataset_version = textvqa_data["dataset_version"]
         self.use_mm_start_end = use_mm_start_end
+        self.use_pil_image = use_pil_image
 
         print("TextVQA_data: ", len(self.textvqa_data))
 
@@ -266,7 +268,10 @@ class TextVQADataset(torch.utils.data.Dataset):
         questions = conversations
         sampled_answer_choices = item["answers"]
 
-        image = self.preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
+        if self.use_pil_image:  # for llama-3.2-vision evaluation
+            image = cv2.cvtColor(np.array(Image.open(image_path)), cv2.COLOR_RGB2BGR)
+        else:
+            image = self.preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
 
         # TextVQA dataset doesn't use masks during training
         masks = torch.rand(0, *ori_size)
@@ -299,12 +304,13 @@ class GQADataset(torch.utils.data.Dataset):
     img_size = 1024
     ignore_label = 255
 
-    def __init__(self, base_image_dir, tokenizer, vision_tower, split="val", use_mm_start_end=False):
+    def __init__(self, base_image_dir, tokenizer, vision_tower, split="val", use_mm_start_end=False, use_pil_image=False):
         self.base_image_dir = base_image_dir
         self.tokenizer = tokenizer
         self.vision_tower = vision_tower
         self.split = split   # e.g., "test", "testdev"
         self.use_mm_start_end = use_mm_start_end
+        self.use_pil_image = use_pil_image
         DATA_DIR = os.path.join(base_image_dir, "gqa")
         with open(os.path.join(DATA_DIR, "questions", f"{split}_balanced_questions.json")) as f:
             self.gqa_data = json.load(f)
@@ -340,9 +346,7 @@ class GQADataset(torch.utils.data.Dataset):
 
         # Process image for CLIP
         clip_image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower)
-        image_clip = clip_image_processor.preprocess(image, return_tensors="pt")[
-            "pixel_values"
-        ][0]
+        image_clip = clip_image_processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
 
         # Process image for SAM
         transform = ResizeLongestSide(224)
@@ -375,7 +379,10 @@ class GQADataset(torch.utils.data.Dataset):
         questions = conversations
         sampled_answer_choices = [item["answer"], item["fullAnswer"]]
 
-        image = self.preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
+        if self.use_pil_image:  # for llama-3.2-vision evaluation
+            image = cv2.cvtColor(np.array(Image.open(image_path)), cv2.COLOR_RGB2BGR)
+        else:
+            image = self.preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
 
         # GQA has no masks
         masks = torch.rand(0, *ori_size)
@@ -537,6 +544,7 @@ class CragMMDataset(torch.utils.data.Dataset):
         image_size: int = 1024,
         exclude_val=False,
         use_mm_start_end=False,
+        use_pil_image=False,
     ):
         self.exclude_val = exclude_val
         self.samples_per_epoch = samples_per_epoch
@@ -552,6 +560,7 @@ class CragMMDataset(torch.utils.data.Dataset):
         self.split = "validation"
         self.dataset = self.crag_mm_data[self.split]
         self.use_mm_start_end = use_mm_start_end
+        self.use_pil_image = use_pil_image
 
     def __len__(self):
         return len(self.dataset)
@@ -574,10 +583,14 @@ class CragMMDataset(torch.utils.data.Dataset):
         # Handle PIL Image directly since item['image'] is a PIL Image object
         if isinstance(item['image'], Image.Image):
             image = cv2.cvtColor(np.array(item['image']), cv2.COLOR_RGB2BGR)
-            image_path = f"crag_mm_image_{item['session_id']}"
+            # cache the image since we need it for search_pipeline
+            image_path = os.path.join(self.base_image_dir, "pixar", "cragmm", "images", f"crag_mm_image_{item['session_id']}.png")
+            if not os.path.exists(image_path):
+                os.makedirs(os.path.dirname(image_path), exist_ok=True)
+                item['image'].save(image_path)
         else:
             # Fallback to file path handling if it's a string
-            image_path = os.path.join(self.base_image_dir, "crag_mm", "images", f"{item['image']}")
+            image_path = os.path.join(self.base_image_dir, "pixar", "cragmm", "images", f"{item['image']}")
             image = cv2.imread(image_path)
             if image is None:  # if the image is not available, use the image_url to download the image
                 image_url = item.get('image_url', None)
@@ -643,7 +656,10 @@ class CragMMDataset(torch.utils.data.Dataset):
         else:
             raise NotImplementedError("Multi-turn is not supported yet")
 
-        image = self.preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
+        if self.use_pil_image:  # for llama-3.2-vision evaluation
+            image = cv2.cvtColor(np.array(item['image']), cv2.COLOR_RGB2BGR)
+        else:
+            image = self.preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
 
         # TODO: CragMM dataset doesn't use masks during evaluation
         masks = torch.rand(0, *ori_size)
@@ -693,9 +709,8 @@ class InfoseekDataset(torch.utils.data.Dataset):
         self.transform = ResizeLongestSide(image_size)
         self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
 
-        self.root = os.path.join(base_image_dir, "infoseek")
-        # self.image_root = os.path.join(self.root, "images")  # "/home/jeonghkim/projects/pixar/data/infoseek/images"
-        self.image_root = os.path.join("/home/jeonghkim/projects/pixar/data/infoseek", "images")
+        self.root = os.path.join(base_image_dir, "pixar","infoseek")
+        self.image_root = os.path.join(base_image_dir, "infoseek", "images")
         split_path = os.path.join(self.root, split_file)
         if not os.path.exists(split_path):
             raise FileNotFoundError(f"[InfoseekDataset] split file not found: {split_path}")
@@ -819,7 +834,7 @@ class OvenDataset(torch.utils.data.Dataset):
         base_image_dir,
         tokenizer,
         vision_tower,
-        mode: str = "entity",  # "entity", "query"
+        mode: str = "query",  # "entity", "query"
         split: str = "val",
         image_size: int = 1024,
         use_mm_start_end: bool = False,
@@ -836,9 +851,8 @@ class OvenDataset(torch.utils.data.Dataset):
         self.transform = ResizeLongestSide(image_size)
         self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
 
-        self.root = os.path.join(base_image_dir, "oven")
-        # self.image_root = os.path.join(self.root, "images")  # "/home/jeonghkim/projects/pixar/data/infoseek/images"
-        self.image_root = os.path.join("/home/jeonghkim/projects/pixar/data/infoseek", "images")
+        self.root = os.path.join(base_image_dir, "pixar","oven")
+        self.image_root = os.path.join(base_image_dir, "infoseek", "images")
 
         fname = f"oven_{'entity' if self.mode=='entity' else 'query'}_{split}.jsonl"
         split_path = os.path.join(self.root, fname)
@@ -880,7 +894,7 @@ class OvenDataset(torch.utils.data.Dataset):
         image_id = item.get("image_id", "")
         question = item.get("question", "")
 
-        if self.mode == "entity":
+        if self.mode == "entity" or self.mode == "query":
             gt = item.get("entity_text", "")
             sampled_answer_choices = [gt] if isinstance(gt, str) else [str(gt)]
         else:
@@ -948,5 +962,5 @@ class OvenDataset(torch.utils.data.Dataset):
             per_token_label_dict,
             search_calls_norm,
             inference,
-            f"oven_{self.mode}",
+            "oven",
         )

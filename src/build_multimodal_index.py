@@ -33,7 +33,6 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from PIL import Image
 from transformers import AutoTokenizer, AutoModel, AutoImageProcessor
-from utils.utils import save_faiss_checkpoint
 
 
 # image caching helpers for wikipedia image url downloading
@@ -85,6 +84,8 @@ def chunk_fixed_tokens(text: str,
                        overlap: int = 32) -> List[str]:
     """Sliding-window token chunking with overlap."""
     words = text.split()
+    if chunk_tokens <= 0 or not 0 <= overlap < chunk_tokens:
+        raise ValueError("Require chunk_tokens > 0 and 0 <= overlap < chunk_tokens")
     stride = chunk_tokens - overlap
     idx = 0
     out = []
@@ -252,7 +253,7 @@ def save_checkpoint(rank, gpu_index,
                     meta_batches, meta_path,
                     index_path, state_path,
                     processed, next_local_id):
-    cpu_idx = faiss.index_gpu_to_cpu(gpu_index)
+    cpu_idx = gpu_index
     faiss.write_index(cpu_idx, str(index_path))
 
     if meta_batches:
@@ -352,7 +353,7 @@ def build_index(d: int,
                 hnsw_m: int = 64):
     """Return a FAISS index given embedding dimension."""
     if index_type == "HNSW":
-        idx = faiss.IndexHNSWFlat(d, hnsw_m)
+        idx = faiss.IndexHNSWFlat(d, hnsw_m, faiss.METRIC_INNER_PRODUCT)
         idx.hnsw.efConstruction = 200
         return idx
     # Default: exact flat inner-product (cosine)
@@ -418,6 +419,9 @@ def main(args):
     state_path = out_dir / f"wiki6m_state_rank_{rank}.json"
     images_dir = out_dir / "images"
 
+    if not args.resume and any(p.exists() for p in (index_path, meta_path, state_path)):
+        raise FileExistsError(f"Index shards already exist in {out_dir}; use --resume or a new output directory")
+
     # if resume, revive the state
     state = load_state(state_path) if args.resume else {"doc_offset": 0, "next_local_id": 0}
     processed = state["doc_offset"]  # how many docs this 'rank' processed
@@ -427,7 +431,7 @@ def main(args):
     if args.resume and index_path.exists():
         cpu_idx = faiss.read_index(str(index_path))
         dim = cpu_idx.d
-        gpu_index = faiss.index_cpu_to_gpu(faiss.StandardGpuResources(), rank, cpu_idx)
+        gpu_index = cpu_idx
         if meta_path.exists():
             pass  # keep previously saved rows out of RAM; re-open on flush
     else:  # peek embedding dim. and create GPU index
@@ -437,8 +441,7 @@ def main(args):
         else:
             dim = encode_passages(args, ["hello"], tokenizer, model, device).shape[1]
         cpu_index = build_index(dim, args.index_type)
-        gpu_index = faiss.index_cpu_to_gpu(faiss.StandardGpuResources(), rank, cpu_index)
-        gpu_index = faiss.IndexIDMap2(gpu_index)
+        gpu_index = faiss.IndexIDMap2(cpu_index)
 
     meta_batches = []
 
@@ -592,8 +595,8 @@ if __name__ == "__main__":
                             ],
                     default="Alibaba-NLP/gme-Qwen2-VL-2B-Instruct"
                 )
-    p.add_argument("--input_jsonl", default="/home/jeonghkim/projects/region-mm-retrieve/data/infoseek/Wiki6M_ver_1_0.jsonl")
-    p.add_argument("--output_dir",  default="/home/jeonghkim/projects/region-mm-retrieve/data/infoseek/wiki6m_index")
+    p.add_argument("--input_jsonl", required=True)
+    p.add_argument("--output_dir",  required=True)
     p.add_argument("--chunk_scheme", choices=["section", "paragraph", "sentence", "token"], default="section")
     p.add_argument("--chunk_tokens", type=int, default=128,
                    help="Token window size when chunk_scheme=token")
@@ -602,7 +605,7 @@ if __name__ == "__main__":
                    help="Sentences per chunk when chunk_scheme=sentence")
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--limit_total", type=int, default=0)
-    p.add_argument("--index_type", choices=["FlatIP", "HNSW"], default="FlatIP")
+    p.add_argument("--index_type", choices=["FlatIP"], default="FlatIP")
     p.add_argument("--resume", action="store_true", help="Resume from a previous run")
     p.add_argument("--cache_wiki_images", action="store_true", help="Cache images from Wikipedia")
     p.add_argument("--checkpoint_step", type=int, default=1000, help="Save index / metadata / state after this many docs per rank")

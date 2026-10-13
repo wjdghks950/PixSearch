@@ -3,6 +3,8 @@ import json
 import os
 import sys
 import cv2
+import re
+import openai
 import time
 import numpy as np
 
@@ -13,7 +15,7 @@ from itertools import islice, chain
 from transformers import BitsAndBytesConfig
 from functools import partial
 from pathlib import Path
-
+from typing import List, Dict, Any
 from model.PIXAR import PIXARForCausalLM
 
 from utils.vqa_dataset import TextVQADataset, GQADataset, POPEDataset, CragMMDataset, InfoseekDataset, OvenDataset
@@ -37,11 +39,11 @@ from chat_pixar_search import (
     SearchTagGuard
 )
 # add IoUEvaluator evaluation functionality
-sys.path.append(os.path.abspath(os.path.join(__file__, '../..')))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from src.evaluation.rle_dict import get_mask_rle_dicts
 from src.evaluation.llm_as_judge_eval import evaluate_answer
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
 from src.local_search_api import LocalSearchPipeline
 
 import logging
@@ -89,16 +91,100 @@ def parse_args(args: list[str] = None, config_str: str = None):
     parser.add_argument("--use_llm_as_judge", action="store_true")
 
     parser.add_argument('--device', default='cuda', type=str)
-    parser.add_argument('--predictions_path', type=str, default='/shared/nas2/jk100/partonomy_private/results/')
+    parser.add_argument('--predictions_path', type=str, default='./results/')
 
     parser.add_argument("--exp_name", default="plum-13b-vqa-eval", type=str)
 
+    parser.add_argument("--search_base_url", default="http://127.0.0.1:7000")
+    parser.add_argument("--search_collection", default="wiki6m_index")
+    parser.add_argument("--search_index_name", default=None)
+    parser.add_argument("--oven_mode", choices=["entity", "query"], default="query")
+    parser.add_argument("--search_k", type=int, default=5)
     parser.add_argument("--no_search", action="store_true", help="If set to True, run regular validate instead of validate_search")
     parser.add_argument("--search_api", default="local", help="search API type; either `local` or `cragmm`.")
     parser.add_argument("--retrieve_type", default="title", help="Retrieved knowledge snippet boundary - ['first_sent', 'title']")
+    parser.add_argument("--format_with_llm", action="store_true", help="Format the results with an LLM")
 
     args = parser.parse_string(config_str) if config_str else parser.parse_args(args)
     return args, parser
+
+
+def format_results_with_llm(
+    results: List[dict],
+    retrieve_type: str,
+    openai_client: openai.Client,
+    model: str,
+    temperature: float = 0.2,
+    **chat_completion_kwargs: Dict[str, Any]) -> str:
+    '''
+    Uses an LLM (e.g., gpt-4o-mini, gpt-4.1-mini) to extract and flatten the
+    essential retrieved entities or phrases from arbitrary retrieval results
+    into a compact, '|' separated string.
+    '''
+    if results is None or len(results) == 0:
+        return " "
+
+    # Convert results to a compact string summary for the prompt
+    try:
+        serialized = json.dumps(results, ensure_ascii=False)
+    except Exception:
+        serialized = str(results)
+
+    # Build prompt for LLM
+    prompt = f"""
+                You are an assistant that extracts the key entities or phrases from search results.
+
+                Below is a JSON-like list of retrieved items. Each item may contain 'title', 'content', or nested lists.
+                Your job is to extract the most informative and relevant entities or short phrases (no full sentences),
+                separated by ' | ' (pipe character). Avoid redundancy and remove any special characters.
+
+                Return ONLY the compact formatted string, nothing else.
+
+                Retrieve type: {retrieve_type}
+                Results:
+                {serialized}
+              """
+
+    messages = [
+        {"role": "system", "content": "You are a concise text formatter."},
+        {"role": "user", "content": prompt},
+    ]
+
+    try:
+        resp = openai_client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=256,
+        )
+        formatted = resp.choices[0].message.content.strip()
+        # sanitize to remove accidental prefixes or line breaks
+        formatted = re.sub(r"[\n\r]+", " ", formatted)
+        formatted = re.sub(r"\s*\|\s*", " | ", formatted)
+
+        # Ensure fallback if model gives empty output
+        if not formatted:
+            formatted = "_"
+        return formatted
+    except Exception as e:
+        print(f"[format_results_with_llm] LLM formatting failed: {e}")
+
+        # fallback: flatten manually
+        def flatten(item):
+            if isinstance(item, (list, tuple)):
+                return " | ".join(flatten(x) for x in item)
+            elif isinstance(item, dict):
+                vals = []
+                for k in ["title", "content", "name", "entity"]:
+                    if k in item and isinstance(item[k], str):
+                        vals.append(item[k])
+                return " ".join(vals)
+            elif isinstance(item, str):
+                return item
+            return ""
+        fallback = [flatten(r) for r in results if r]
+        fallback_str = " | ".join([x.strip() for x in fallback if x.strip()])
+        return fallback_str if fallback_str else "_"
 
 
 def main(args: list[str] = None, config_str: str = None):
@@ -194,6 +280,8 @@ def main(args: list[str] = None, config_str: str = None):
     model.eval()
 
     # build dataset for validation
+    dataset_name, split = args.val_dataset.split("|", 1)
+    val_dataset = None
     if "textvqa" in args.val_dataset:
         val_dataset = TextVQADataset(
             base_image_dir=args.dataset_dir,
@@ -204,7 +292,8 @@ def main(args: list[str] = None, config_str: str = None):
         val_dataset = GQADataset(
             base_image_dir=args.dataset_dir,
             tokenizer=tokenizer,
-            vision_tower=args.vision_tower
+            vision_tower=args.vision_tower,
+            split=split
         )
     elif "pope" in args.val_dataset:
         val_dataset = POPEDataset(
@@ -213,6 +302,8 @@ def main(args: list[str] = None, config_str: str = None):
             vision_tower=args.vision_tower
         )
     elif "cragmm" in args.val_dataset:
+        if split != "validation":
+            raise ValueError("CRAG-MM loader supports validation only")
         val_dataset = CragMMDataset(
             base_image_dir=args.dataset_dir,
             tokenizer=tokenizer,
@@ -222,13 +313,15 @@ def main(args: list[str] = None, config_str: str = None):
         val_dataset = InfoseekDataset(
             base_image_dir=args.dataset_dir,
             tokenizer=tokenizer,
-            vision_tower=args.vision_tower
+            vision_tower=args.vision_tower,
+            split_file=f"infoseek_{split}.jsonl"
         )
     elif "oven" in args.val_dataset:
         val_dataset = OvenDataset(
             base_image_dir=args.dataset_dir,
             tokenizer=tokenizer,
-            vision_tower=args.vision_tower
+            vision_tower=args.vision_tower,
+            split=split, mode=args.oven_mode
         )
     # build DataLoader
     if val_dataset is not None:
@@ -257,28 +350,29 @@ def main(args: list[str] = None, config_str: str = None):
         search_api_type = args.search_api.lower().strip()
         if search_api_type == "local":
             search_pipeline = LocalSearchPipeline(
-                base_url="http://127.0.0.1:7000",
-                collection="wiki10k_index",
-                index_name=None,
+                base_url=args.search_base_url,
+                collection=args.search_collection,
+                index_name=args.search_index_name,
                 pooling="mean",
             )
         elif search_api_type == "cragmm":
             from cragmm_search.search import UnifiedSearchPipeline
-            os.environ["HTTPS_PROXY"] = "http://fwdproxy:8080"
-            os.environ["NO_PROXY"] = ",".join([
-                ".fbcdn.net", ".facebook.com", ".thefacebook.com", ".tfbnw.net",
-                ".fb.com", ".fburl.com", ".facebook.net", ".sb.fbsbx.com", "localhost"
-            ])
+            # os.environ["HTTPS_PROXY"] = "http://fwdproxy:8080"
+            # os.environ["NO_PROXY"] = ",".join([
+            #     ".fbcdn.net", ".facebook.com", ".thefacebook.com", ".tfbnw.net",
+            #     ".fb.com", ".fburl.com", ".facebook.net", ".sb.fbsbx.com", "localhost"
+            # ])
             search_pipeline = UnifiedSearchPipeline(
                 image_model_name="openai/clip-vit-large-patch14-336",
                 image_hf_dataset_id="crag-mm-2025/image-search-index-validation",
                 text_model_name="BAAI/bge-large-en-v1.5",
                 web_hf_dataset_id="crag-mm-2025/web-search-index-validation",
             )
+            search_pipeline.device = torch.device("cuda", args.local_rank)  # assign search_api to available GPU
         # run search API calling `validate_search`
         validate_search(
             val_loader, model, tokenizer, args, parser,
-            search_pipeline=search_pipeline, search_k=5,
+            search_pipeline=search_pipeline, search_k=args.search_k,
             vis_save_path="./vis_output", max_new_tokens=args.model_max_length
         )
 
@@ -325,7 +419,7 @@ def validate_search(
         f'predictions_{args.val_dataset.split("|")[0]}_{args.val_dataset.split("|")[1]}_{args.llm_model}_{args.use_llm_as_judge}_search_api_{args.search_api}.jsonl'
     )
 
-    def _generate_with_tools_for_batch(batch):
+    def _generate_with_tools_for_batch(batch, openai_client=None):
         device = next(model.parameters()).device  # model’s device
         images_clip = batch['images_clip'].to(device)
         images_for_sam = batch['images'].to(device)
@@ -436,8 +530,6 @@ def validate_search(
             )
             print(f">> step: {steps}, payload_text: {payload_text}")
 
-            # breakpoint()  # TODO: Check if tokenizer '<search>' token is handled differently from '</search>'
-
             # Mark handled and close one open scope
             last_handled_end_abs = end_abs
             # guard.on_close()
@@ -508,6 +600,7 @@ def validate_search(
                 results = search_pipeline(input_query, k=search_k)
             except Exception as e:
                 results = [{"error": str(e), "input_query": input_query}]
+                breakpoint()
 
             trunc_results = []
             if results is not None:
@@ -519,14 +612,20 @@ def validate_search(
                         payload_contents = [{r['title']: first_sentence_tokenizer(r['content'])} for r in results]
                     elif args.retrieve_type == "title":
                         try:
-                            payload_contents = [r['title'] for r in results]  # TODO: Error - r in results seem to be a list; str indexing gives error
+                            if args.search_api == "cragmm":
+                                if args.format_with_llm:
+                                    payload_contents = format_results_with_llm(results, args.retrieve_type, openai_client=openai_client, model=args.llm_model, temperature=0.2, max_tokens=256)
+                                else:
+                                    payload_contents = [r['entities'][0]['entity_name'] for r in results[0]]
+                            elif args.search_api == "local":
+                                payload_contents = [r['title'] for r in results]
                         except KeyError as e:
                             print(e)
                             breakpoint()
                     else:
                         payload_contents = [{r['title']: r['content']} for r in results]
 
-                    payload_text_out = format_payload(payload_contents)
+                    payload_text_out = format_payload(payload_contents) if not args.format_with_llm else payload_contents
 
             injected = f"{INFORMATION_START_TOKEN} {payload_text_out} {INFORMATION_END_TOKEN}"
             generated = append_text_to_ids(tokenizer, generated, injected, device)
@@ -549,6 +648,12 @@ def validate_search(
     val_iter = iter(val_loader)
     pbar = tqdm.tqdm(range(n_batches), desc="Validating (<search> API calling)")
 
+    if args.format_with_llm:
+        TIMEOUT_SECONDS = 120
+        openai_client = openai.Client(timeout=TIMEOUT_SECONDS)
+    else:
+        openai_client = None
+
     for _ in pbar:
         try:
             batch = next(val_iter)
@@ -566,7 +671,7 @@ def validate_search(
         batch['images_clip'] = to_dtype(batch['images_clip'])
 
         # run tool-aware generation
-        interleaved_text = _generate_with_tools_for_batch(batch)
+        interleaved_text = _generate_with_tools_for_batch(batch, openai_client=openai_client)
 
         # evaluate answer text vs GT like your current validate()
         ground_truth_text = batch['sampled_classes_list'][0]
@@ -583,13 +688,13 @@ def validate_search(
             "ground_truth_text": ground_truth_text,
             "accuracy": accuracy
         }
-        with open(pred_file_path, "a") as f:
+        with open(pred_file_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(out, ensure_ascii=False) + "\n")
 
     # summarize accuracy
     existing = []
     if os.path.exists(pred_file_path):
-        with open(pred_file_path, "r") as f:
+        with open(pred_file_path, "r", encoding="utf-8") as f:
             for line in f:
                 existing.append(json.loads(line))
         total_acc = sum(d["accuracy"] for d in existing) / max(1, len(existing))
@@ -614,15 +719,31 @@ def validate(val_loader, model, tokenizer, args, parser):
     Path(args.predictions_path).mkdir(parents=True, exist_ok=True)
     pred_file_path = os.path.join(
         args.predictions_path,
-        f'predictions_{args.val_dataset.split("|")[0]}_{args.val_dataset.split("|")[1]}_{args.llm_model}_{args.use_llm_as_judge}.jsonl'
+        # f'predictions_{args.val_dataset.split("|")[0]}_{args.val_dataset.split("|")[1]}_{args.llm_model}_{args.use_llm_as_judge}.jsonl'
+        f'predictions_{args.val_dataset.split("|")[0]}_{args.val_dataset.split("|")[1]}_{args.llm_model}_{args.use_llm_as_judge}_test.jsonl'
     )
+
+    # read the existing output and start from the last index
+    existing_output_dicts = []
+    if os.path.exists(pred_file_path):
+        with open(pred_file_path, "r") as f:
+            for line in f:
+                existing_output_dicts.append(json.loads(line))
+        last_index = len(existing_output_dicts)
+    else:
+        last_index = 0
 
     val_iter = iter(val_loader)
     pbar = tqdm.tqdm(range(n_batches), desc="Validating Partonomy with PLUM")
 
+    print(f">> last_index: {last_index}")
+    print(f">> val_loader length: {len(val_loader)}")
+
     total_accuracy, total_f1 = 0.0, 0.0
     output_dicts = []
     for idx in pbar:
+        if idx < last_index:
+            continue
         try:
             batch = next(val_iter)
         except StopIteration:
@@ -673,21 +794,23 @@ def validate(val_loader, model, tokenizer, args, parser):
         if args.use_llm_as_judge:
             score, explanation = evaluate_answer(output_text, ground_truth_text, model=args.llm_model)
             accuracy = score
+            f1_score = 0.0
             print(f">> score: {score}, explanation: {explanation}")
         else:
             evaluator = TextVQAAccuracyEvaluator()
-            accuracy = evaluator.eval_pred_list([{'pred_answer': output_text, 'gt_answers': ground_truth_text}])
+            accuracy, f1_score = evaluator.eval_pred_list([{'pred_answer': output_text, 'gt_answers': ground_truth_text}])
 
-        logger.info(f"==> Output Text: {output_text} | Ground Truth Text: {ground_truth_text} | Accuracy: {accuracy}")
+        logger.info(f"==> Output Text: {output_text} | Ground Truth Text: {ground_truth_text} | Accuracy: {accuracy} | F1 Score: {f1_score}")
 
         total_accuracy += accuracy
-
+        total_f1 += f1_score
         output_dict = {
             "image_path": batch['image_paths'][0],
             "output_text": output_text,
             "ground_truth_text": ground_truth_text,
             "pred_masks": get_mask_rle_dicts(pred_masks_np, pred_texts),
-            "accuracy": accuracy
+            "accuracy": accuracy,
+            "f1_score": f1_score
         }
         output_dicts.append(output_dict)
 
@@ -702,10 +825,14 @@ def validate(val_loader, model, tokenizer, args, parser):
                 existing_output_dicts.append(json.loads(line))
 
         total_accuracy = sum([d['accuracy'] for d in existing_output_dicts]) / len(existing_output_dicts)
+        total_f1 = sum([d['f1_score'] for d in existing_output_dicts]) / len(existing_output_dicts)
         print(f"==> Total Accuracy: {total_accuracy}")
+        print(f"==> Total F1 Score: {total_f1}")
     else:
         total_accuracy = total_accuracy / n_batches
+        total_f1 = total_f1 / n_batches
         print(f"==> Total Accuracy: {total_accuracy}")
+        print(f"==> Total F1 Score: {total_f1}")
         with open(pred_file_path, 'w') as f:
             json.dump(output_dicts, f)
 

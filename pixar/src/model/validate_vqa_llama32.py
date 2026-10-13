@@ -26,29 +26,35 @@
 #     --limit_batches 200
 
 import os
+import re
 import sys
 import json
 import time
 import cv2
 import numpy as np
 import tqdm
+import openai
 import argparse
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 
 import torch
 from PIL import Image
-from transformers import MllamaForConditionalGeneration, AutoProcessor
+from transformers import AutoModelForVision2Seq, AutoProcessor
 
 # ==== your utilities ====
-# dataset + collator + evaluators (kept identical to your validate_vqa.py usage)
-from utils.dataset import collate_fn
+# dataset + evaluators
 from utils.vqa_dataset import TextVQADataset, GQADataset, POPEDataset, CragMMDataset, InfoseekDataset, OvenDataset
 from utils.m4c_evaluator import TextVQAAccuracyEvaluator
 
 # search helpers / pipelines (reused to match your validate_search)
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
 from src.local_search_api import LocalSearchPipeline
+
+sys.path.append(os.path.abspath(os.path.join(__file__, '../..')))
+from src.evaluation.rle_dict import get_mask_rle_dicts
+from src.evaluation.llm_as_judge_eval import evaluate_answer
+
 
 # ==== special token strings used in prompting ====
 SEARCH_START_TOKEN = "<search>"
@@ -63,7 +69,7 @@ REGION_TOKEN       = "<region>"
 # -----------------------------------------------------------------------------
 def build_parser():
     p = argparse.ArgumentParser("Llama-3.2-Vision VQA validator (raw / inject / search)")
-    p.add_argument("--model_id", default="meta-llama/Llama-3.2-11B-Vision", type=str)
+    p.add_argument("--model_id", default="meta-llama/Llama-3.2-11B-Vision-Instruct", type=str)
     p.add_argument("--device", default="cuda", type=str)
     p.add_argument("--precision", default="bf16", choices=["fp32", "bf16", "fp16"])
 
@@ -85,6 +91,9 @@ def build_parser():
     p.add_argument("--max_new_tokens", default=128, type=int)
     p.add_argument("--predictions_path", required=True, type=str)
     p.add_argument("--llm_as_judge", action="store_true", help="(optional) not used by default; stick to TextVQAAccuracyEvaluator")
+    p.add_argument("--format_with_llm", action="store_true", help="Format the results with an LLM")
+    p.add_argument("--llm_model", default="gpt-4o", type=str)
+    p.add_argument("--use_llm_as_judge", action="store_true")
     return p
 
 # -----------------------------------------------------------------------------
@@ -93,17 +102,17 @@ def build_parser():
 def build_val_dataset(args, vision_tower_id="openai/clip-vit-large-patch14"):
     ds = args.val_dataset
     if "textvqa" in ds:
-        return TextVQADataset(args.dataset_dir, None, vision_tower_id)
+        return TextVQADataset(args.dataset_dir, None, vision_tower_id, use_pil_image=True)
     if "gqa" in ds:
-        return GQADataset(args.dataset_dir, None, vision_tower_id)
+        return GQADataset(args.dataset_dir, None, vision_tower_id, use_pil_image=True)
     if "pope" in ds:
-        return POPEDataset(args.dataset_dir, None, vision_tower_id)
+        return POPEDataset(args.dataset_dir, None, vision_tower_id, use_pil_image=True)
     if "cragmm" in ds:
-        return CragMMDataset(args.dataset_dir, None, vision_tower_id)
+        return CragMMDataset(args.dataset_dir, None, vision_tower_id, use_pil_image=True)
     if "infoseek" in ds:
-        return InfoseekDataset(args.dataset_dir, None, vision_tower_id)
+        return InfoseekDataset(args.dataset_dir, None, vision_tower_id, use_pil_image=True)
     if "oven" in ds:
-        return OvenDataset(args.dataset_dir, None, vision_tower_id)
+        return OvenDataset(args.dataset_dir, None, vision_tower_id, use_pil_image=True)
     raise ValueError(f"Unsupported val_dataset: {ds}")
 
 def build_loader(args, tokenizer_stub=None):
@@ -115,13 +124,7 @@ def build_loader(args, tokenizer_stub=None):
         shuffle=False,
         num_workers=args.workers,
         pin_memory=False,
-        collate_fn=lambda batch: collate_fn(
-            batch,
-            tokenizer=tokenizer_stub,  # not used for Llama32 path
-            conv_type="llava_v1",
-            use_mm_start_end=False,
-            local_rank=0
-        )
+        collate_fn=None  # No custom collation - use dataset items directly
     )
 
 # -----------------------------------------------------------------------------
@@ -145,7 +148,7 @@ def extract_question(conv_text: str) -> str:
             continue
         if "<img_start>" in line.lower() or "<img_end>" in line.lower():
             continue
-        question_lines.append(line.strip())
+        question_lines.append(line.strip().replace("###", ""))
     q = " ".join([t for t in question_lines if t]).strip()
     if not q:
         # fallback: keep original
@@ -179,7 +182,86 @@ def get_search_pipeline(args):
     else:
         raise ValueError(f"Unknown search_api: {args.search_api}")
 
-def format_results(results: List[dict], retrieve_type: str) -> str:
+
+def format_results_with_llm(
+    results: List[dict],
+    retrieve_type: str,
+    openai_client: openai.Client,
+    model: str,
+    temperature: float = 0.2,
+    **chat_completion_kwargs: Dict[str, Any]) -> str:
+    '''
+    Uses an LLM (e.g., gpt-4o-mini, gpt-4.1-mini) to extract and flatten the
+    essential retrieved entities or phrases from arbitrary retrieval results
+    into a compact, '|' separated string.
+    '''
+    if results is None or len(results) == 0:
+        return " "
+
+    # Convert results to a compact string summary for the prompt
+    try:
+        serialized = json.dumps(results, ensure_ascii=False)
+    except Exception:
+        serialized = str(results)
+
+    # Build prompt for LLM
+    prompt = f"""
+                You are an assistant that extracts the key entities or phrases from search results.
+
+                Below is a JSON-like list of retrieved items. Each item may contain 'title', 'content', or nested lists.
+                Your job is to extract the most informative and relevant entities or short phrases (no full sentences),
+                separated by ' | ' (pipe character). Avoid redundancy and remove any special characters.
+
+                Return ONLY the compact formatted string, nothing else.
+
+                Retrieve type: {retrieve_type}
+                Results:
+                {serialized}
+              """
+
+    messages = [
+        {"role": "system", "content": "You are a concise text formatter."},
+        {"role": "user", "content": prompt},
+    ]
+
+    try:
+        resp = openai_client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=256,
+        )
+        formatted = resp.choices[0].message.content.strip()
+        # sanitize to remove accidental prefixes or line breaks
+        formatted = re.sub(r"[\n\r]+", " ", formatted)
+        formatted = re.sub(r"\s*\|\s*", " | ", formatted)
+
+        # Ensure fallback if model gives empty output
+        if not formatted:
+            formatted = "_"
+        return formatted
+    except Exception as e:
+        print(f"[format_results_with_llm] LLM formatting failed: {e}")
+
+        # fallback: flatten manually
+        def flatten(item):
+            if isinstance(item, (list, tuple)):
+                return " | ".join(flatten(x) for x in item)
+            elif isinstance(item, dict):
+                vals = []
+                for k in ["title", "content", "name", "entity"]:
+                    if k in item and isinstance(item[k], str):
+                        vals.append(item[k])
+                return " ".join(vals)
+            elif isinstance(item, str):
+                return item
+            return ""
+        fallback = [flatten(r) for r in results if r]
+        fallback_str = " | ".join([x.strip() for x in fallback if x.strip()])
+        return fallback_str if fallback_str else "_"
+
+
+def format_results(results: List[dict], retrieve_type: str, format_with_llm: bool = False) -> str:
     if results is None or len(results) == 0:
         return "_"
     safe = []
@@ -203,6 +285,7 @@ def format_results(results: List[dict], retrieve_type: str) -> str:
                 safe.append(f"{title}: {content}")
             elif content:
                 safe.append(content)
+
     if not safe:
         return "_"
     # collapse to a compact payload
@@ -218,7 +301,7 @@ def load_llama32(model_id: str, device: str, precision: str):
         dtype = torch.float16
     else:
         dtype = torch.float32
-    model = MllamaForConditionalGeneration.from_pretrained(
+    model = AutoModelForVision2Seq.from_pretrained(
         model_id, torch_dtype=dtype, device_map="auto"
     )
     processor = AutoProcessor.from_pretrained(model_id)
@@ -248,41 +331,67 @@ def evaluate_raw(args, model, processor, val_loader, out_path):
     os.makedirs(out_path, exist_ok=True)
     dump_path = os.path.join(out_path, f"predictions_{args.val_dataset.replace('|','_')}_raw.jsonl")
 
+    # load from the out_path and start from the last index
+    if os.path.exists(dump_path):
+        with open(dump_path, "r", encoding="utf-8") as f:
+            for line_idx, line in enumerate(f):
+                last_line_idx = line_idx
+    else:
+        last_line_idx = 0
+
+    last_line_idx += 1
+
     n_batches = min(args.limit_batches, len(val_loader)) if args.limit_batches > 0 else len(val_loader)
     it = iter(val_loader)
     pbar = tqdm.tqdm(range(n_batches), desc="[raw] Llama-3.2-Vision eval")
 
-    for _ in pbar:
+    acc = 0.0
+    f1_score = 0.0
+    for line_idx in pbar:
+        if line_idx < last_line_idx:
+            continue
         try:
             batch = next(it)
-        except StopIteration:
+        except Exception:
             break
 
-        img_path = batch["image_paths"][0]
-        conv = batch["conversation_list"][0]    # your conversation string
+        # Dataset returns: (image_path, image, image_clip, conversations, masks, label, resize, questions, sampled_classes, ...)
+        img_path = batch[0][0]  # First element is image_path, batch is list of tuples
+        conv = batch[3][0][0]  # conversations is at index 3, first conversation
         question = extract_question(conv)
-        image_pil = load_rgb_image(img_path)
+
+        image_pil = load_rgb_image(img_path) if batch[1] is None else batch[1]
 
         prompt = f"<|image|><|begin_of_text|>{question}"
         output_text = gen_once(model, processor, image_pil, prompt, args.max_new_tokens)
 
-        gt = batch["sampled_classes_list"][0]
-        acc = evaluator.eval_pred_list([{"pred_answer": output_text, "gt_answers": gt}])
+        gt = batch[8][0][0]  # sampled_classes is at index 8
+        if args.use_llm_as_judge and args.val_dataset == "cragmm":
+            score, explanation = evaluate_answer(output_text, gt, model=args.llm_model)
+            acc = score
+            f1_score = 0.0
+        else:
+            evaluator = TextVQAAccuracyEvaluator()
+            acc, f1_score = evaluator.eval_pred_list([{'pred_answer': output_text, 'gt_answers': gt}])
 
-        rec = {"image_path": img_path, "question": question, "output_text": output_text, "ground_truth_text": gt, "accuracy": acc}
+        rec = {"image_path": img_path, "question": question, "output_text": output_text, "ground_truth_text": gt, "accuracy": acc, "f1_score": f1_score}
         with open(dump_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     # summarize
     accs = []
+    f1_scores = []
     with open(dump_path, "r", encoding="utf-8") as f:
         for line in f:
             try:
                 accs.append(json.loads(line)["accuracy"])
+                f1_scores.append(json.loads(line)["f1_score"])
             except Exception:
                 pass
-    total = float(sum(accs) / max(1, len(accs)))
-    print(f"==> [raw] Total Accuracy: {total:.4f}")
+    total_acc = float(sum(accs) / max(1, len(accs)))
+    total_f1 = float(sum(f1_scores) / max(1, len(f1_scores)))
+    print(f"==> [raw] Total Accuracy: {total_acc:.4f}")
+    print(f"==> [raw] Total F1: {total_f1:.4f}")
 
 def run_inject_query(search_pipe, args, img_path: str, question: str, use_img: bool, use_text: bool):
     queries = []
@@ -302,56 +411,87 @@ def run_inject_query(search_pipe, args, img_path: str, question: str, use_img: b
 
 def evaluate_inject(args, model, processor, val_loader, out_path):
     evaluator = TextVQAAccuracyEvaluator()
+    TIMEOUT_SECONDS = 120   # make sure OPENAI_API_KEY is set in your environment.
+    openai_client = openai.Client(timeout=TIMEOUT_SECONDS)
     os.makedirs(out_path, exist_ok=True)
     dump_path = os.path.join(out_path, f"predictions_{args.val_dataset.replace('|','_')}_inject_{args.inject_where}.jsonl")
 
-    search_pipe = get_search_pipeline(args)
-    use_img = "img" in [s.strip().lower() for s in args.inject_sources.split(",")]
-    use_text = "text" in [s.strip().lower() for s in args.inject_sources.split(",")]
+    # load and read from dump_path and start from the last line_idx
+    if os.path.exists(dump_path):
+        with open(dump_path, "r", encoding="utf-8") as f:
+            for line_idx, line in enumerate(f):
+                last_line_idx = line_idx
+    else:
+        last_line_idx = 0
+
+    last_line_idx += 1
 
     n_batches = min(args.limit_batches, len(val_loader)) if args.limit_batches > 0 else len(val_loader)
     it = iter(val_loader)
     pbar = tqdm.tqdm(range(n_batches), desc=f"[inject:{args.inject_where}] Llama-3.2-Vision eval")
 
-    for _ in pbar:
+    search_pipe = get_search_pipeline(args)
+    use_img = "img" in [s.strip().lower() for s in args.inject_sources.split(",")]
+    use_text = "text" in [s.strip().lower() for s in args.inject_sources.split(",")]
+
+    for line_idx in pbar:
+        if line_idx < last_line_idx:
+            continue
+
+        breakpoint()
+
         try:
             batch = next(it)
         except StopIteration:
             break
 
-        img_path = batch["image_paths"][0]
-        conv = batch["conversation_list"][0]
+        # Dataset returns: (image_path, image, image_clip, conversations, masks, label, resize, questions, sampled_classes, ...)
+        img_path = batch[0][0]  # First element is image_path
+        conv = batch[3][0][0]  # conversations is at index 3, first conversation
         question = extract_question(conv)
-        image_pil = load_rgb_image(img_path)
+        image_pil = load_rgb_image(img_path) if batch[1] is None else batch[1]
 
         # retrieve
         results = run_inject_query(search_pipe, args, img_path, question, use_img, use_text)
-        info = format_results(results, args.retrieve_type)
+
+        if args.format_with_llm:
+            info = format_results_with_llm(results, args.retrieve_type, openai_client, args.llm_model, temperature=0.2, max_tokens=256)
+        else:
+            info = format_results(results, args.retrieve_type)
         info_block = f"{INFO_START_TOKEN} {info} {INFO_END_TOKEN}"
 
         if args.inject_where == "prepend":
-            prompt = f"<|image|><|begin_of_text|>{info_block}\n{question}"
-        else:
-            prompt = f"<|image|><|begin_of_text|>{question}\n{info_block}"
+            prompt = f"<|image|><|begin_of_text|>Retrieved Information: {info_block}\n{question}Answer:"
+        else:  # append
+            prompt = f"<|image|><|begin_of_text|>{question}\nRetrieved Information:{info_block}\nAnswer:"
 
         output_text = gen_once(model, processor, image_pil, prompt, args.max_new_tokens)
 
-        gt = batch["sampled_classes_list"][0]
-        acc = evaluator.eval_pred_list([{"pred_answer": output_text, "gt_answers": gt}])
+        gt = batch[8][0][0]  # sampled_classes is at index 8
+        if args.use_llm_as_judge:
+            score, explanation = evaluate_answer(output_text, gt, model=args.llm_model)
+            acc = score
+            f1_score = 0.0
+        else:
+            acc, f1_score = evaluator.eval_pred_list([{"pred_answer": output_text, "gt_answers": gt}])
 
-        rec = {"image_path": img_path, "question": question, "info": info, "output_text": output_text, "ground_truth_text": gt, "accuracy": acc}
+        rec = {"image_path": img_path, "question": question, "info": info, "output_text": output_text, "ground_truth_text": gt, "accuracy": acc, "f1_score": f1_score}
         with open(dump_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     accs = []
+    f1_scores = []
     with open(dump_path, "r", encoding="utf-8") as f:
         for line in f:
             try:
                 accs.append(json.loads(line)["accuracy"])
+                f1_scores.append(json.loads(line)["f1_score"])
             except Exception:
                 pass
-    total = float(sum(accs) / max(1, len(accs)))
-    print(f"==> [inject] Total Accuracy: {total:.4f}")
+    total_acc = float(sum(accs) / max(1, len(accs)))
+    total_f1 = float(sum(f1_scores) / max(1, len(f1_scores)))
+    print(f"==> [inject] Total Accuracy: {total_acc:.4f}")
+    print(f"==> [inject] Total F1: {total_f1:.4f}")
 
 def find_closed_search_spans(text: str) -> List[Tuple[int,int,str]]:
     """
@@ -392,10 +532,13 @@ def evaluate_search(args, model, processor, val_loader, out_path):
         except StopIteration:
             break
 
-        img_path = batch["image_paths"][0]
-        image_pil = load_rgb_image(img_path)
-        conv = batch["conversation_list"][0]
+        # Dataset returns: (image_path, image, image_clip, conversations, masks, label, resize, questions, sampled_classes, ...)
+        img_path = batch[0][0]  # First element is image_path
+        image_pil = load_rgb_image(img_path) if batch[1] is None else batch[1]
+        conv = batch[0][3][0]  # conversations is at index 3, first conversation
         question = extract_question(conv)
+
+        breakpoint()
 
         # System instruction per your spec:
         sys_prompt = (
@@ -493,29 +636,39 @@ def evaluate_search(args, model, processor, val_loader, out_path):
         if not final_output:
             final_output = base_prompt  # last known prompt content
 
-        gt = batch["sampled_classes_list"][0]
-        acc = evaluator.eval_pred_list([{"pred_answer": final_output, "gt_answers": gt}])
+        gt = batch[0][8]  # sampled_classes is at index 8
+        if args.use_llm_as_judge:
+            score, explanation = evaluate_answer(final_output, gt, model=args.llm_model)
+            acc = score
+            f1_score = 0.0
+        else:
+            acc, f1_score = evaluator.eval_pred_list([{"pred_answer": final_output, "gt_answers": gt}])
 
         rec = {
             "image_path": img_path,
             "question": question,
             "output_text": final_output,
             "ground_truth_text": gt,
-            "accuracy": acc
+            "accuracy": acc,
+            "f1_score": f1_score
         }
         with open(dump_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     # summarize
     accs = []
+    f1_scores = []
     with open(dump_path, "r", encoding="utf-8") as f:
         for line in f:
             try:
                 accs.append(json.loads(line)["accuracy"])
+                f1_scores.append(json.loads(line)["f1_score"])
             except Exception:
                 pass
-    total = float(sum(accs) / max(1, len(accs)))
-    print(f"==> [search] Total Accuracy: {total:.4f}")
+    total_acc = float(sum(accs) / max(1, len(accs)))
+    total_f1 = float(sum(f1_scores) / max(1, len(f1_scores)))
+    print(f"==> [search] Total Accuracy: {total_acc:.4f}")
+    print(f"==> [search] Total F1: {total_f1:.4f}")
 
 # -----------------------------------------------------------------------------
 # Main
